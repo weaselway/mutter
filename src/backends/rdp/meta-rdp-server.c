@@ -92,10 +92,17 @@
 /* Buffer ids are 1-based; buffer i uses id (i + 1). */
 #define META_RDP_BUFFER_ID(i) ((uint64_t) ((i) + 1))
 
-/* Two buffers is enough to overlap our readback with the client's upload: we
- * write one while the client reads the other. More would only help if the
- * client fell more than a frame behind, which the ack gating prevents. */
-#define META_RDP_N_BUFFERS 2
+/* Three buffers.
+ *
+ * Two would be enough if the readback were synchronous -- write one while the
+ * client reads the other. With the asynchronous path (see "Asynchronous
+ * readback" below) a third is needed, because one buffer is tied up as the
+ * destination of a readback that has been issued but not yet landed, and is
+ * neither ours to rewrite nor the client's to read. At two, the steady state
+ * would be one buffer mid-readback and one with the client, leaving none free,
+ * and every frame would fall into the coalescing path in
+ * meta_rdp_peer_present(). */
+#define META_RDP_N_BUFFERS 3
 
 /* GUID form: "{...}" = 32 hex + 4 dashes + 2 braces. */
 #define META_RDP_SHARED_MEMORY_NAME_SIZE (32 + 4 + 2)
@@ -229,6 +236,26 @@ typedef struct _MetaRdpPeerContext
   void *shm_addr;
   size_t shm_size;
   char shm_name[META_RDP_SHARED_MEMORY_NAME_SIZE + 1];
+
+  /* Asynchronous readback state. See the "Asynchronous readback" block below.
+   *
+   * At most one readback is outstanding at a time, which is what keeps this a
+   * handful of fields rather than a queue: the fence for frame N has almost
+   * always signalled by the time frame N+1 is painted, and if it has not, the
+   * damage simply coalesces the way a busy buffer already makes it.
+   *
+   * @readback_pbo is persistent and only reallocated when the frame size
+   * changes -- allocating one costs ~22ms (a committed READBACK-heap resource),
+   * against ~3us to map one that already exists. */
+  CoglPixelBuffer *readback_pbo;
+  size_t readback_pbo_size;
+  CoglGpuFence *readback_fence;
+  gboolean readback_pending;
+  int readback_buffer;        /* pool buffer the pixels are destined for */
+  MtkRectangle readback_rect; /* what was read, in framebuffer pixels */
+  int readback_polls;         /* fence polls so far, for the bounded fallback */
+  guint readback_poll_id;
+  int64_t readback_issued_us;
 
   gboolean frame_missed; /* damage arrived with no buffer free to take it */
   /* Union of the damage that accumulated while a present was in flight. Kept
@@ -454,8 +481,16 @@ meta_rdp_server_get_stage (MetaRdpServer *self)
  * not what the driver moved internally, so MB/s here is a lower bound. */
 static void
 meta_rdp_account_readback (int64_t elapsed_us,
+                           int64_t fence_us,
                            size_t  bytes)
 {
+  /* Tracked separately from @elapsed_us because the fence is easy to assume is
+   * free and profiling showed it is not: creating one can drain a
+   * threaded-context driver's queue on the calling thread. Anything other than
+   * a near-zero figure here means the fence is doing submission work inside the
+   * paint. */
+  static int64_t window_fence_us = 0;
+  static double mean_fence_us = -1.0;
   /* Weight of the newest sample in the rolling means; ~5s of history. */
   static const double alpha = 0.2;
   static int64_t window_start_us = 0;
@@ -471,6 +506,7 @@ meta_rdp_account_readback (int64_t elapsed_us,
   int64_t elapsed_window_us;
 
   window_us += elapsed_us;
+  window_fence_us += fence_us;
   window_bytes += bytes;
   window_reads++;
   if (elapsed_us > window_peak_us)
@@ -487,18 +523,21 @@ meta_rdp_account_readback (int64_t elapsed_us,
     return;
 
   double us = (double) window_us / window_reads;
+  double fence = (double) window_fence_us / window_reads;
   double rps = window_reads * (double) G_USEC_PER_SEC / elapsed_window_us;
   double bps = window_bytes * (double) G_USEC_PER_SEC / elapsed_window_us;
 
   if (mean_us < 0.0)
     {
       mean_us = us;
+      mean_fence_us = fence;
       mean_rps = rps;
       mean_bps = bps;
     }
   else
     {
       mean_us = alpha * us + (1.0 - alpha) * mean_us;
+      mean_fence_us = alpha * fence + (1.0 - alpha) * mean_fence_us;
       mean_rps = alpha * rps + (1.0 - alpha) * mean_rps;
       mean_bps = alpha * bps + (1.0 - alpha) * mean_bps;
     }
@@ -507,14 +546,17 @@ meta_rdp_account_readback (int64_t elapsed_us,
    * blocked in glReadPixels; at 60fps anything approaching 100% means the
    * compositor is doing nothing but readback. */
   g_message ("rdp: readback %.0f us/read (mean %.0f, peak %.0f), "
+             "%.0f us fence (mean %.0f), "
              "%.1f reads/s (mean %.1f), %.2f MB/s (mean %.2f), %.1f%% of wall",
              us, mean_us, (double) window_peak_us,
+             fence, mean_fence_us,
              rps, mean_rps,
              bps / (1024.0 * 1024.0), mean_bps / (1024.0 * 1024.0),
-             100.0 * window_us / elapsed_window_us);
+             100.0 * (window_us + window_fence_us) / elapsed_window_us);
 
   window_start_us = now_us;
   window_us = 0;
+  window_fence_us = 0;
   window_peak_us = 0;
   window_bytes = 0;
   window_reads = 0;
@@ -763,6 +805,85 @@ meta_rdp_probe_readback_pbo (CoglFramebuffer *framebuffer)
   g_object_unref (pbo);
 }
 
+/* Companion meter for the asynchronous path, reported like the one above.
+ *
+ * Three numbers, because they answer different questions:
+ *   - copy: how long the memcpy out of the mapped PBO takes. This is the cost
+ *     the asynchronous path *adds*; the direct path wrote into shared memory
+ *     with no copy at all. If it approaches the synchronous readback time the
+ *     whole exercise is pointless.
+ *   - latency: issue to collect. How stale the frame the client sees is, and
+ *     whether the fence is signalling within a frame or dragging.
+ *   - blocking: how many collections had to block because the fence had not
+ *     signalled by the time we ran out of patience. Should be zero. */
+static void
+meta_rdp_account_readback_collect (int64_t  copy_us,
+                                   int64_t  latency_us,
+                                   size_t   bytes,
+                                   gboolean blocked)
+{
+  static const double alpha = 0.2;
+  static int64_t window_start_us = 0;
+  static int64_t window_copy_us = 0;
+  static int64_t window_latency_us = 0;
+  static size_t window_bytes = 0;
+  static unsigned window_collects = 0;
+  static unsigned window_blocked = 0;
+  static double mean_copy_us = -1.0;
+  static double mean_latency_us = -1.0;
+
+  int64_t now_us = g_get_monotonic_time ();
+  int64_t elapsed_us;
+
+  window_copy_us += copy_us;
+  window_latency_us += latency_us;
+  window_bytes += bytes;
+  window_collects++;
+  if (blocked)
+    window_blocked++;
+
+  if (window_start_us == 0)
+    {
+      window_start_us = now_us;
+      return;
+    }
+
+  elapsed_us = now_us - window_start_us;
+  if (elapsed_us < G_USEC_PER_SEC)
+    return;
+
+  double copy = (double) window_copy_us / window_collects;
+  double latency = (double) window_latency_us / window_collects;
+
+  if (mean_copy_us < 0.0)
+    {
+      mean_copy_us = copy;
+      mean_latency_us = latency;
+    }
+  else
+    {
+      mean_copy_us = alpha * copy + (1.0 - alpha) * mean_copy_us;
+      mean_latency_us = alpha * latency + (1.0 - alpha) * mean_latency_us;
+    }
+
+  g_message ("rdp: collect %.0f us copy (mean %.0f), %.0f us latency "
+             "(mean %.0f), %.1f collects/s, %.2f MB/s, %u blocked, "
+             "%.1f%% of wall",
+             copy, mean_copy_us, latency, mean_latency_us,
+             window_collects * (double) G_USEC_PER_SEC / elapsed_us,
+             window_bytes * (double) G_USEC_PER_SEC / elapsed_us /
+             (1024.0 * 1024.0),
+             window_blocked,
+             100.0 * window_copy_us / elapsed_us);
+
+  window_start_us = now_us;
+  window_copy_us = 0;
+  window_latency_us = 0;
+  window_bytes = 0;
+  window_collects = 0;
+  window_blocked = 0;
+}
+
 /* Read the @width x @height region at (@x, @y) of @framebuffer into @dest
  * (ARGB8888, i.e. BGRA byte order in memory, which is what NSCodec's
  * PIXEL_FORMAT_BGRA32, gfxredir's ARGB_8888 and an uncompressed SURFACE_BITS
@@ -808,7 +929,7 @@ meta_rdp_read_framebuffer (CoglFramebuffer *framebuffer,
                                                  bitmap);
   if (ok)
     {
-      meta_rdp_account_readback (g_get_monotonic_time () - started_us,
+      meta_rdp_account_readback (g_get_monotonic_time () - started_us, 0,
                                  (size_t) width * height * 4);
     }
 
@@ -873,6 +994,61 @@ meta_rdp_account_update (size_t bytes)
   window_start_us = now_us;
   window_bytes = 0;
   window_updates = 0;
+}
+
+/* Rolling meter for FreeRDP's socket servicing, in the same shape as the
+ * readback meters.
+ *
+ * rdp_client_activity() runs CheckFileDescriptor() on the main loop: TLS
+ * decrypt, PDU parsing and input dispatch, all of it between frames. Profiling
+ * shows a visible SSL/BIO stack there, but it has never been measured, and
+ * whether it is worth moving to its own thread is exactly the sort of question
+ * that should be settled with a number rather than a flame graph's width. */
+static void
+meta_rdp_account_client_activity (int64_t elapsed_us)
+{
+  static const double alpha = 0.2;
+  static int64_t window_start_us = 0;
+  static int64_t window_us = 0;
+  static int64_t window_peak_us = 0;
+  static unsigned window_calls = 0;
+  static double mean_us = -1.0;
+
+  int64_t now_us = g_get_monotonic_time ();
+  int64_t elapsed_window_us;
+
+  window_us += elapsed_us;
+  window_calls++;
+  if (elapsed_us > window_peak_us)
+    window_peak_us = elapsed_us;
+
+  if (window_start_us == 0)
+    {
+      window_start_us = now_us;
+      return;
+    }
+
+  elapsed_window_us = now_us - window_start_us;
+  if (elapsed_window_us < G_USEC_PER_SEC)
+    return;
+
+  double us = (double) window_us / window_calls;
+
+  if (mean_us < 0.0)
+    mean_us = us;
+  else
+    mean_us = alpha * us + (1.0 - alpha) * mean_us;
+
+  g_message ("rdp: client activity %.0f us/call (mean %.0f, peak %.0f), "
+             "%.1f calls/s, %.1f%% of wall",
+             us, mean_us, (double) window_peak_us,
+             window_calls * (double) G_USEC_PER_SEC / elapsed_window_us,
+             100.0 * window_us / elapsed_window_us);
+
+  window_start_us = now_us;
+  window_us = 0;
+  window_peak_us = 0;
+  window_calls = 0;
 }
 
 static void
@@ -1069,6 +1245,11 @@ error:
   return FALSE;
 }
 
+/* Defined with the rest of the asynchronous readback machinery below; needed
+ * here because tearing the pool down has to abandon any readback aimed at it. */
+static void meta_rdp_readback_cancel (MetaRdpPeerContext *peer_ctx);
+static void meta_rdp_readback_free (MetaRdpPeerContext *peer_ctx);
+
 static void
 meta_rdp_destroy_buffer (MetaRdpPeerContext *peer_ctx)
 {
@@ -1076,6 +1257,11 @@ meta_rdp_destroy_buffer (MetaRdpPeerContext *peer_ctx)
 
   if (!peer_ctx->buffer_created)
     return;
+
+  /* Before anything else: a readback issued against this pool is about to have
+   * its destination unmapped. Drop it rather than let it complete into a freed
+   * mapping. */
+  meta_rdp_readback_cancel (peer_ctx);
 
   if (redir)
     {
@@ -1275,7 +1461,14 @@ meta_rdp_copy_between_buffers (MetaRdpPeerContext *peer_ctx,
     }
 }
 
-/* Pick a buffer the client is not reading, or -1 if all are in flight. */
+/* Pick a buffer nobody else is using, or -1 if there is none.
+ *
+ * Two ways a buffer can be unavailable, not one: the client may still be
+ * reading it (@in_flight), or it may be the destination of a readback we have
+ * issued but whose pixels have not landed yet. The second case has no flag of
+ * its own because at most one readback is outstanding -- it is simply the
+ * buffer named by @readback_buffer. Handing that one out again would let the
+ * next frame's stale-fill and readback race the copy-out of the previous one. */
 static int
 meta_rdp_acquire_buffer (MetaRdpPeerContext *peer_ctx)
 {
@@ -1283,14 +1476,385 @@ meta_rdp_acquire_buffer (MetaRdpPeerContext *peer_ctx)
     {
       int i = (peer_ctx->next_buffer + n) % META_RDP_N_BUFFERS;
 
-      if (!peer_ctx->buffers[i].in_flight)
-        {
-          peer_ctx->next_buffer = (i + 1) % META_RDP_N_BUFFERS;
-          return i;
-        }
+      if (peer_ctx->buffers[i].in_flight)
+        continue;
+
+      if (peer_ctx->readback_pending && peer_ctx->readback_buffer == i)
+        continue;
+
+      peer_ctx->next_buffer = (i + 1) % META_RDP_N_BUFFERS;
+      return i;
     }
 
   return -1;
+}
+
+/* ------------------------------------------------------------------ */
+/* Asynchronous readback                                               */
+/*                                                                     */
+/* glReadPixels straight into shared memory blocks the main loop for as */
+/* long as the GPU takes to hand the pixels over -- measured at ~10ms   */
+/* per frame, around 60% of wall-clock time, which is time the          */
+/* compositor is not painting or servicing input.                       */
+/*                                                                     */
+/* Instead the readback targets a persistent pixel buffer object on a   */
+/* driver readback heap, followed by a fence. Issuing costs nothing;    */
+/* the pixels are collected on a later main-loop pass, once the fence   */
+/* says the transfer is done, and only then copied into the shared      */
+/* buffer and presented.                                                */
+/*                                                                     */
+/* The cost this adds is that copy: the pixels land in the PBO and have */
+/* to be memcpy'd into shared memory, which the direct path did not do. */
+/* Off a readback heap that is an ordinary CPU-side copy of the damage  */
+/* rect, paid instead of a full pipeline stall.                          */
+/*                                                                     */
+/* At most one readback is outstanding at a time. A ring would allow    */
+/* frame N+1 to be issued while N is still landing, but at 60fps the    */
+/* fence has essentially always signalled by the next frame, and the    */
+/* bookkeeping for out-of-order completion is a large amount of state   */
+/* for a case that does not arise. When it does arise, the damage       */
+/* coalesces exactly as it already does when every buffer is busy.       */
+/* ------------------------------------------------------------------ */
+
+/* Poll interval while waiting for the fence. GLib rounds poll timeouts up to
+ * whole milliseconds, so this is the floor regardless of what we ask for. */
+#define META_RDP_READBACK_POLL_MS 1
+/* Fallback interval when there is no fence to poll: the collect then happens at
+ * the next frame, and this only has to cover the case where none comes. */
+#define META_RDP_READBACK_IDLE_MS 16
+/* Give up polling and block after this many polls (~200ms). Only reachable if
+ * a fence never signals, which should not happen -- cogl_gpu_fence_new() has
+ * already flushed. Bounded so a lost fence degrades to the old synchronous
+ * behaviour instead of freezing the session one frame stale. */
+#define META_RDP_READBACK_MAX_POLLS 200
+
+static void meta_rdp_gfxredir_send_present (MetaRdpPeerContext *peer_ctx,
+                                            int                 index,
+                                            const MtkRectangle *damage);
+
+static void
+meta_rdp_readback_disarm (MetaRdpPeerContext *peer_ctx)
+{
+  GSource *current;
+
+  if (peer_ctx->readback_poll_id == 0)
+    return;
+
+  /* The collect paths below can be reached either from the frame clock or from
+   * inside the poll callback itself. In the latter case g_source_remove() would
+   * destroy the source while it is dispatching; clearing the id is enough,
+   * because the callback returns G_SOURCE_REMOVE whenever it finds it cleared. */
+  current = g_main_current_source ();
+  if (current && g_source_get_id (current) == peer_ctx->readback_poll_id)
+    peer_ctx->readback_poll_id = 0;
+  else
+    g_clear_handle_id (&peer_ctx->readback_poll_id, g_source_remove);
+}
+
+/* Abandon an outstanding readback without collecting it.
+ *
+ * Used when the thing it was going to be written into is going away: a resize
+ * tears down the pool and unmaps the shared memory, and completing afterwards
+ * would copy into a freed mapping. The pixels are simply dropped; the caller is
+ * in the middle of invalidating everything anyway. */
+static void
+meta_rdp_readback_cancel (MetaRdpPeerContext *peer_ctx)
+{
+  if (!peer_ctx->readback_pending)
+    return;
+
+  g_debug ("rdp: cancelling in-flight readback into buffer %d",
+           peer_ctx->readback_buffer);
+
+  meta_rdp_readback_disarm (peer_ctx);
+  g_clear_pointer (&peer_ctx->readback_fence, cogl_gpu_fence_free);
+  peer_ctx->readback_pending = FALSE;
+  peer_ctx->readback_buffer = -1;
+  peer_ctx->readback_polls = 0;
+}
+
+static void
+meta_rdp_readback_free (MetaRdpPeerContext *peer_ctx)
+{
+  meta_rdp_readback_cancel (peer_ctx);
+  g_clear_object (&peer_ctx->readback_pbo);
+  peer_ctx->readback_pbo_size = 0;
+}
+
+/* Collect a finished readback: copy the PBO into the shared buffer and present.
+ *
+ * @force maps regardless of the fence, which blocks until the transfer
+ * completes. Only the bounded fallback and teardown use that. */
+static gboolean
+meta_rdp_readback_finish (MetaRdpPeerContext *peer_ctx,
+                          gboolean            force)
+{
+  CoglBuffer *buffer;
+  MtkRectangle rect;
+  const uint8_t *src;
+  uint8_t *dst;
+  size_t src_stride;
+  int index;
+  int64_t started_us;
+  int64_t copied_us;
+
+  if (!peer_ctx->readback_pending)
+    return FALSE;
+
+  /* No fence means cogl had no GL_ARB_sync; such a readback is always
+   * collected immediately with force=TRUE, so there is nothing to poll. */
+  if (!force &&
+      (!peer_ctx->readback_fence ||
+       !cogl_gpu_fence_is_signalled (peer_ctx->readback_fence)))
+    return FALSE;
+
+  buffer = COGL_BUFFER (peer_ctx->readback_pbo);
+  index = peer_ctx->readback_buffer;
+  rect = peer_ctx->readback_rect;
+
+  /* The pool can have been torn down while this was in flight (resize); if so
+   * there is nowhere to put the pixels. */
+  if (!peer_ctx->buffer_created || !peer_ctx->shm_addr ||
+      index < 0 || index >= META_RDP_N_BUFFERS)
+    {
+      meta_rdp_readback_cancel (peer_ctx);
+      return FALSE;
+    }
+
+  started_us = g_get_monotonic_time ();
+
+  src = cogl_buffer_map (buffer, COGL_BUFFER_ACCESS_READ, 0);
+  if (!src)
+    {
+      g_warning ("rdp: could not map the readback PBO; dropping the frame");
+      meta_rdp_readback_cancel (peer_ctx);
+      return FALSE;
+    }
+
+  /* The readback packed the rect tightly, so its rows are rect.width * 4 apart;
+   * the destination rows are a full frame apart. Row by row either way. */
+  src_stride = (size_t) rect.width * 4;
+  dst = (uint8_t *) peer_ctx->shm_addr +
+        peer_ctx->buffers[index].offset +
+        (size_t) rect.y * peer_ctx->buffer_stride +
+        (size_t) rect.x * 4;
+
+  for (int y = 0; y < rect.height; y++)
+    {
+      memcpy (dst + (size_t) y * peer_ctx->buffer_stride,
+              src + (size_t) y * src_stride,
+              src_stride);
+    }
+
+  cogl_buffer_unmap (buffer);
+
+  copied_us = g_get_monotonic_time ();
+  meta_rdp_account_readback_collect (copied_us - started_us,
+                                     copied_us - peer_ctx->readback_issued_us,
+                                     (size_t) rect.width * rect.height * 4,
+                                     force);
+
+  meta_rdp_readback_disarm (peer_ctx);
+  g_clear_pointer (&peer_ctx->readback_fence, cogl_gpu_fence_free);
+  peer_ctx->readback_pending = FALSE;
+  peer_ctx->readback_buffer = -1;
+  peer_ctx->readback_polls = 0;
+
+  meta_rdp_gfxredir_send_present (peer_ctx, index, &rect);
+  return TRUE;
+}
+
+static gboolean
+meta_rdp_readback_poll_cb (gpointer user_data)
+{
+  MetaRdpPeerContext *peer_ctx = user_data;
+
+  if (!peer_ctx->readback_pending)
+    {
+      peer_ctx->readback_poll_id = 0;
+      return G_SOURCE_REMOVE;
+    }
+
+  peer_ctx->readback_polls++;
+
+  /* Both branches below go through meta_rdp_readback_finish(), which disarms;
+   * from in here that just clears the id (see meta_rdp_readback_disarm()), and
+   * returning G_SOURCE_REMOVE is what actually tears the source down. */
+  if (meta_rdp_readback_finish (peer_ctx, peer_ctx->readback_fence == NULL))
+    return G_SOURCE_REMOVE;
+
+  if (peer_ctx->readback_polls >= META_RDP_READBACK_MAX_POLLS)
+    {
+      g_warning ("rdp: readback fence has not signalled after %d polls; "
+                 "collecting synchronously",
+                 peer_ctx->readback_polls);
+      meta_rdp_readback_finish (peer_ctx, TRUE);
+      return G_SOURCE_REMOVE;
+    }
+
+  /* Disarmed underneath us -- the readback was cancelled, or an error path
+   * dropped it. Let this source go rather than leave it running alongside the
+   * timer the next readback will arm, which would poll the same fence twice. */
+  if (peer_ctx->readback_poll_id == 0)
+    return G_SOURCE_REMOVE;
+
+  return G_SOURCE_CONTINUE;
+}
+
+/* Try to collect without waiting. Called at the top of each frame, which is
+ * where the fence has almost always signalled already -- the poll timer is the
+ * fallback for when no next frame comes, since mutter renders on damage. */
+static void
+meta_rdp_readback_collect_if_ready (MetaRdpPeerContext *peer_ctx)
+{
+  /* With no fence there is nothing to test, so this is where the deliberately
+   * fenceless mode actually collects: one frame after the readback was issued,
+   * by which point the frame's own flush has submitted it and the GPU has had a
+   * full frame to finish. The map is unguarded, so the collect meter's
+   * "blocked" count is what says whether that assumption holds. */
+  if (peer_ctx->readback_pending)
+    meta_rdp_readback_finish (peer_ctx, peer_ctx->readback_fence == NULL);
+}
+
+/* Make sure the PBO exists and is big enough for a full frame. */
+static gboolean
+meta_rdp_readback_ensure_pbo (MetaRdpPeerContext *peer_ctx,
+                              CoglContext        *cogl_context,
+                              size_t              size)
+{
+  if (peer_ctx->readback_pbo && peer_ctx->readback_pbo_size >= size)
+    return TRUE;
+
+  /* Never reallocate under an outstanding readback. */
+  meta_rdp_readback_free (peer_ctx);
+
+  peer_ctx->readback_pbo = cogl_pixel_buffer_new_for_readback (cogl_context,
+                                                               size);
+  if (!peer_ctx->readback_pbo)
+    return FALSE;
+
+  peer_ctx->readback_pbo_size = size;
+  g_message ("rdp: allocated a %zu-byte readback PBO", size);
+  return TRUE;
+}
+
+/* Issue a readback of @rect into the PBO and fence it.
+ *
+ * Returns FALSE if the asynchronous path is unavailable, in which case the
+ * caller falls back to reading straight into shared memory. */
+static gboolean
+meta_rdp_readback_begin (MetaRdpPeerContext *peer_ctx,
+                         CoglFramebuffer    *framebuffer,
+                         int                 index,
+                         const MtkRectangle *rect)
+{
+  CoglContext *cogl_context = cogl_framebuffer_get_context (framebuffer);
+  CoglGpuFence *fence;
+  CoglBitmap *bitmap;
+  size_t full_size;
+  int64_t issued_us;
+  int64_t read_us;
+  int64_t fence_started_us;
+  gboolean ok;
+  /* Read once: this is on the per-frame path. */
+  static int fence_disabled = -1;
+
+  if (fence_disabled < 0)
+    fence_disabled = g_getenv ("META_RDP_NO_FENCE") != NULL;
+
+  g_return_val_if_fail (!peer_ctx->readback_pending, FALSE);
+
+  /* Size for a whole frame, not for this rect: the PBO has to survive damage
+   * rects of every shape without being reallocated, and reallocation is three
+   * orders of magnitude more expensive than reuse. */
+  full_size = (size_t) peer_ctx->buffer_width * peer_ctx->buffer_height * 4;
+  if (!meta_rdp_readback_ensure_pbo (peer_ctx, cogl_context, full_size))
+    return FALSE;
+
+  /* Pack tightly at offset 0 rather than mirroring the frame layout: the
+   * transfer is then exactly the damaged pixels, and rowstride == bpp * width
+   * keeps cogl off its stride-mismatch path (which would read into a malloc'd
+   * temporary and bypass the PBO entirely). */
+  bitmap = cogl_bitmap_new_from_buffer (COGL_BUFFER (peer_ctx->readback_pbo),
+                                        COGL_PIXEL_FORMAT_BGRA_8888_PRE,
+                                        rect->width, rect->height,
+                                        rect->width * 4,
+                                        0);
+  if (!bitmap)
+    return FALSE;
+
+  /* Timed with the same meter as the synchronous path, so the two are directly
+   * comparable: this is what "% of wall" was 60% of before. Issuing into a PBO
+   * should be near-free -- if this is still milliseconds, the transfer is not
+   * actually being deferred and the fence is decorating a stall rather than
+   * removing one. */
+  issued_us = g_get_monotonic_time ();
+  ok = cogl_framebuffer_read_pixels_into_bitmap (framebuffer,
+                                                 rect->x, rect->y,
+                                                 COGL_READ_PIXELS_COLOR_BUFFER,
+                                                 bitmap);
+  read_us = g_get_monotonic_time () - issued_us;
+
+  g_object_unref (bitmap);
+
+  if (!ok)
+    return FALSE;
+
+  /* After the readback, so it marks that transfer's completion.
+   *
+   * Timed separately and reported alongside the read: profiling caught an
+   * earlier version of cogl_gpu_fence_new() flushing eagerly, which on this
+   * threaded-context driver executed the frame's queued draw calls inline, on
+   * the paint path. It no longer does -- the flush rides the first poll -- but
+   * this is exactly the kind of cost that hides, so it is measured rather than
+   * assumed. */
+  fence_started_us = g_get_monotonic_time ();
+
+  /* META_RDP_NO_FENCE trades the fence for a frame of latency.
+   *
+   * Creating a fence measures ~1.16ms here, several times the readback it
+   * guards, and it is not our cost to remove: glFenceSync() always flushes
+   * (mesa syncobj.c), and on d3d12 even a PIPE_FLUSH_DEFERRED closes and
+   * submits the command list, with tc_sync blocking on the driver thread.
+   *
+   * Without a fence there is no completion signal, so the readback is instead
+   * collected at the *next* frame's paint. By then the frame's own end-of-frame
+   * flush has submitted it and the GPU has had a full frame to finish, so the
+   * map should not block -- but it is a map without a guarantee, so the collect
+   * meter's "blocked" count is what says whether that holds. Off by default. */
+  fence = fence_disabled ? NULL : cogl_gpu_fence_new (cogl_context);
+
+  meta_rdp_account_readback (read_us,
+                             g_get_monotonic_time () - fence_started_us,
+                             (size_t) rect->width * rect->height * 4);
+
+  peer_ctx->readback_fence = fence;
+  peer_ctx->readback_pending = TRUE;
+  peer_ctx->readback_buffer = index;
+  peer_ctx->readback_rect = *rect;
+  peer_ctx->readback_polls = 0;
+  peer_ctx->readback_issued_us = g_get_monotonic_time ();
+
+  if (!fence && !fence_disabled)
+    {
+      /* No fence *support* (cogl built without GL_ARB_sync). Nothing will ever
+       * tell us the transfer finished, so collect now and take the blocking
+       * map. No better than the direct path, but correct. */
+      meta_rdp_readback_finish (peer_ctx, TRUE);
+      return TRUE;
+    }
+
+  /* Fenceless by choice collects at the next frame, so it only needs the timer
+   * as the no-next-frame fallback -- polling it at 1ms would just burn wakeups
+   * discovering there is still nothing to test. */
+  meta_rdp_readback_disarm (peer_ctx);
+  peer_ctx->readback_poll_id =
+    g_timeout_add_full (G_PRIORITY_DEFAULT,
+                        fence ? META_RDP_READBACK_POLL_MS
+                              : META_RDP_READBACK_IDLE_MS,
+                        meta_rdp_readback_poll_cb, peer_ctx, NULL);
+
+  return TRUE;
 }
 
 static void
@@ -1298,11 +1862,8 @@ meta_rdp_present_gfxredir (MetaRdpPeerContext *peer_ctx,
                            CoglFramebuffer    *framebuffer,
                            const MtkRectangle *damage)
 {
-  GfxRedirServerContext *redir = peer_ctx->gfxredir;
   int width = cogl_framebuffer_get_width (framebuffer);
   int height = cogl_framebuffer_get_height (framebuffer);
-  GFXREDIR_PRESENT_BUFFER_PDU present = { 0 };
-  RECTANGLE_32 opaque_rect;
   MtkRectangle rect;
   MetaRdpBuffer *buffer;
   int index;
@@ -1384,9 +1945,14 @@ meta_rdp_present_gfxredir (MetaRdpPeerContext *peer_ctx,
     }
   g_clear_pointer (&buffer->stale, mtk_region_unref);
 
-  /* Read just the damaged region straight into its place in the shared buffer.
-   * Passing the full buffer_stride is what lets a narrow region land at the
-   * right offset on every row. */
+  /* Preferred path: read into the PBO and let the fence tell us when it has
+   * landed. The present happens from meta_rdp_readback_finish(), not here. */
+  if (meta_rdp_readback_begin (peer_ctx, framebuffer, index, &rect))
+    return;
+
+  /* Fallback: read straight into its place in the shared buffer, blocking
+   * until the GPU hands the pixels over. Passing the full buffer_stride is
+   * what lets a narrow region land at the right offset on every row. */
   if (!meta_rdp_read_framebuffer (framebuffer,
                                   (uint8_t *) peer_ctx->shm_addr +
                                   buffer->offset +
@@ -1399,6 +1965,32 @@ meta_rdp_present_gfxredir (MetaRdpPeerContext *peer_ctx,
       g_warning ("rdp: framebuffer readback failed (gfxredir path)");
       return;
     }
+
+  meta_rdp_gfxredir_send_present (peer_ctx, index, &rect);
+}
+
+/* Publish a buffer whose pixels have actually landed in shared memory.
+ *
+ * Split out because the synchronous and asynchronous readback paths reach this
+ * point at different times: synchronously right after glReadPixels returns,
+ * asynchronously only once the fence has signalled and the PBO has been copied
+ * out. Calling it any earlier would tell the client to upload pixels that are
+ * not there yet, and -- worse -- would make @last_written name a buffer with a
+ * hole in it, which meta_rdp_copy_between_buffers() would then propagate into
+ * every other buffer in the pool. That corruption is invisible until something
+ * triggers a full refresh. */
+static void
+meta_rdp_gfxredir_send_present (MetaRdpPeerContext *peer_ctx,
+                                int                 index,
+                                const MtkRectangle *damage)
+{
+  GfxRedirServerContext *redir = peer_ctx->gfxredir;
+  MetaRdpBuffer *buffer = &peer_ctx->buffers[index];
+  GFXREDIR_PRESENT_BUFFER_PDU present = { 0 };
+  RECTANGLE_32 opaque_rect;
+  MtkRectangle rect = *damage;
+  int width = peer_ctx->buffer_width;
+  int height = peer_ctx->buffer_height;
 
   /* This buffer is now current; every other buffer is missing this frame. */
   peer_ctx->last_written = index;
@@ -1434,13 +2026,12 @@ meta_rdp_present_gfxredir (MetaRdpPeerContext *peer_ctx,
 
   g_debug ("rdp: gfxredir -> PresentBuffer presentId=%" G_GUINT64_FORMAT
            " bufferId=%" G_GUINT64_FORMAT " windowId=%" G_GUINT64_FORMAT
-           " rect=%ux%u+%u+%u target=%dx%d (damage was %dx%d+%d+%d)",
+           " rect=%ux%u+%u+%u target=%dx%d",
            (uint64_t) present.presentId, (uint64_t) present.bufferId,
            (uint64_t) present.windowId,
            present.dirtyRect.width, present.dirtyRect.height,
            present.dirtyRect.left, present.dirtyRect.top,
-           width, height,
-           damage->width, damage->height, damage->x, damage->y);
+           width, height);
 
   if (redir->PresentBuffer (redir, &present) == 0)
     {
@@ -1597,8 +2188,10 @@ meta_rdp_peer_present (MetaRdpPeerContext *peer_ctx,
 
       /* With more than one buffer we can start a frame while the client is
        * still reading the previous one; we only have to wait when every
-       * buffer is in flight. */
-      if (peer_ctx->n_presents_inflight >= META_RDP_N_BUFFERS)
+       * buffer is in flight, or when the previous frame's readback has not
+       * landed yet (only one is outstanding at a time). */
+      if (peer_ctx->n_presents_inflight >= META_RDP_N_BUFFERS ||
+          peer_ctx->readback_pending)
         {
           /* Coalesce by merging this damage into what we still owe the
            * client, rather than dropping it and re-sending the whole screen
@@ -2107,6 +2700,15 @@ on_frame_ready (MetaStage        *stage,
 
   for (l = self->peers; l; l = l->next)
     {
+      /* Collect last frame's readback before starting this one. By now its
+       * fence has almost always signalled, so this is the path that actually
+       * retires readbacks in steady state -- the 1ms poll timer exists for the
+       * case where no next frame comes, since mutter renders on damage.
+       *
+       * Doing it here also frees the buffer it was targeting, so the present
+       * below has one more to choose from. */
+      meta_rdp_readback_collect_if_ready (l->data);
+
       meta_rdp_peer_present (l->data, framebuffer, damage);
     }
 }
@@ -3453,7 +4055,7 @@ xf_peer_activate (freerdp_peer *client)
 }
 
 static gboolean
-rdp_client_activity (gpointer data)
+rdp_client_activity_inner (gpointer data)
 {
   freerdp_peer *client = data;
   MetaRdpPeerContext *peer_ctx = (MetaRdpPeerContext *) client->context;
@@ -3516,6 +4118,27 @@ out_clean:
   return FALSE;
 }
 
+/* Timing wrapper. Everything above runs on mutter's main loop, so the figure
+ * this reports is time the compositor spends servicing the RDP socket instead
+ * of painting -- the input to deciding whether the peer belongs on its own
+ * thread. Kept as a wrapper so the measurement cannot drift away from the work
+ * if the body grows another early return. */
+static gboolean
+rdp_client_activity (gpointer data)
+{
+  int64_t started_us = g_get_monotonic_time ();
+  gboolean keep;
+
+  keep = rdp_client_activity_inner (data);
+
+  /* Only when it survived: the teardown path frees the peer, and charging
+   * destruction to steady-state socket servicing would skew the mean. */
+  if (keep)
+    meta_rdp_account_client_activity (g_get_monotonic_time () - started_us);
+
+  return keep;
+}
+
 static BOOL
 rdp_peer_context_new (freerdp_peer *client, rdpContext *context)
 {
@@ -3538,6 +4161,9 @@ rdp_peer_context_new (freerdp_peer *client, rdpContext *context)
     }
 
   peer_ctx->shm_fd = -1;
+  /* -1, not 0: 0 is a valid buffer index, and meta_rdp_acquire_buffer() checks
+   * this field whenever a readback is pending. */
+  peer_ctx->readback_buffer = -1;
 
   return TRUE;
 }
@@ -3560,7 +4186,11 @@ rdp_peer_context_free (freerdp_peer *client, rdpContext *context)
   peer_ctx->clipboard_fd_source = NULL;
   meta_rdp_peer_clear_clipboard (peer_ctx);
 
+  /* destroy_buffer() cancels any outstanding readback; this additionally drops
+   * the PBO itself, which outlives individual pools. */
   meta_rdp_destroy_buffer (peer_ctx);
+  meta_rdp_readback_free (peer_ctx);
+
   if (peer_ctx->gfxredir)
     {
       /* Close() joins the channel's reader thread, so no callback can be
