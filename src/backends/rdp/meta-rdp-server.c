@@ -1463,6 +1463,12 @@ meta_rdp_acquire_buffer (MetaRdpPeerContext *peer_ctx)
 
 /* Poll interval while waiting for the fence. GLib rounds poll timeouts up to
  * whole milliseconds, so this is the floor regardless of what we ask for. */
+/* D3D12_TEXTURE_DATA_PITCH_ALIGNMENT. Not d3d12-specific in principle -- it is
+ * whatever the driver reports as texture_to_buffer_copy_row_alignment -- but
+ * there is no GL way to ask, and 256 is the largest value in use, so aligning
+ * to it satisfies every driver that supports the copy at all. */
+#define META_RDP_READBACK_ALIGN_BYTES 256
+
 #define META_RDP_READBACK_POLL_MS 1
 /* Fallback interval when there is no fence to poll: the collect then happens at
  * the next frame, and this only has to cover the case where none comes. */
@@ -1865,6 +1871,27 @@ meta_rdp_present_gfxredir (MetaRdpPeerContext *peer_ctx,
       rect.width = width;
       rect.height = height;
     }
+
+  /* Widen the rect so its row stride is 256-byte aligned.
+   *
+   * That is what a driver needs to copy the blitted region straight into the
+   * PBO on the GPU instead of mapping it and memcpying on this thread. Mesa
+   * will not pad rows to reach the alignment itself -- it must not, since the
+   * PBO layout is ours -- so an unaligned width silently costs us the whole
+   * asynchronous path. Rounding out here is far cheaper than the fallback: the
+   * extra pixels are read and sent, but the read is off the critical path
+   * entirely, whereas the fallback blocks on the GPU every frame.
+   *
+   * If the framebuffer width itself is not a multiple of the alignment the
+   * final chunk cannot be aligned, and we simply take the slow path there. */
+  {
+    int align_px = META_RDP_READBACK_ALIGN_BYTES / 4;
+    int x1 = rect.x + rect.width;
+
+    rect.x = rect.x - (rect.x % align_px);
+    x1 = MIN (width, ((x1 + align_px - 1) / align_px) * align_px);
+    rect.width = x1 - rect.x;
+  }
 
   /* Bring this buffer up to date before writing into it. It missed every frame
    * that went to another buffer, so those regions still hold old pixels. The
