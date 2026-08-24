@@ -319,9 +319,12 @@ endif
 # In-process RDP/VAIL output backend (WSLg).
 #
 # We link against upstream FreeRDP 3.x. The gfxredir server channel that the
-# VAIL fast path needs is built only when FreeRDP is configured with
-# -DCHANNEL_GFXREDIR=ON (it defaults to OFF upstream), so probe for the header
-# rather than assuming it is present.
+# VAIL fast path needs defaults to OFF upstream, so distribution builds install
+# freerdp/server/gfxredir.h but ship no gfxredir symbols in
+# libfreerdp-server3. We therefore build the channel ourselves out of
+# src/backends/rdp/gfxredir (see the README there); it needs nothing beyond the
+# public WTS virtual-channel API. All we have to probe for is the header, which
+# supplies the GfxRedirServerContext ABI.
 have_rdp = get_option('rdp').enabled()
 have_gfxredir = false
 if have_rdp
@@ -332,12 +335,7 @@ if have_rdp
   winpr_dep = dependency('winpr3', version: freerdp_req,
     required: get_option('rdp'))
   rdp_deps = [freerdp_dep, freerdp_server_dep, winpr_dep]
-  # freerdp/server/gfxredir.h is installed unconditionally, but the matching
-  # server symbols only exist when the channel was enabled at FreeRDP build
-  # time. Probe the constructor so a header-only hit does not turn into a link
-  # failure; without it we fall back to the NSCodec present path.
-  have_gfxredir = cc.has_function('gfxredir_server_context_new',
-    prefix: '#include <freerdp/server/gfxredir.h>',
+  have_gfxredir = cc.has_header('freerdp/server/gfxredir.h',
     dependencies: freerdp_server_dep)
 endif
 
