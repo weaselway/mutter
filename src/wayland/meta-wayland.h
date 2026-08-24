@@ -79,6 +79,8 @@ const char             *meta_wayland_get_wayland_display_name   (MetaWaylandComp
 
 #ifdef HAVE_XWAYLAND
 META_EXPORT_TEST
+void                    meta_wayland_publish_xwayland_display_env (MetaWaylandCompositor *compositor);
+
 const char             *meta_wayland_get_public_xwayland_display_name  (MetaWaylandCompositor *compositor);
 
 const char             *meta_wayland_get_private_xwayland_display_name (MetaWaylandCompositor *compositor);
