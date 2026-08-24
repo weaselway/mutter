@@ -250,6 +250,63 @@ meta_rdp_read_framebuffer (CoglFramebuffer *framebuffer,
 }
 
 
+/* Warn when a single present blocks the main loop for longer than this. */
+#define META_RDP_SLOW_UPDATE_US (30 * 1000)
+
+/* HACK: rolling throughput meter for the raw present path. Exponentially
+ * weighted so it tracks recent activity rather than the whole session average,
+ * and reported once a second. Process-wide statics -- with one client that is
+ * all we need, and this is a tuning aid, not instrumentation worth keeping. */
+static void
+meta_rdp_account_update (size_t bytes)
+{
+  /* Weight of the newest sample in the rolling means; ~5s of history. */
+  static const double alpha = 0.2;
+  static int64_t window_start_us = 0;
+  static size_t window_bytes = 0;
+  static unsigned window_updates = 0;
+  static double mean_bps = -1.0;
+  static double mean_ups = -1.0;
+
+  int64_t now_us = g_get_monotonic_time ();
+  int64_t elapsed_us;
+
+  window_bytes += bytes;
+  window_updates++;
+
+  if (window_start_us == 0)
+    {
+      window_start_us = now_us;
+      return;
+    }
+
+  elapsed_us = now_us - window_start_us;
+  if (elapsed_us < G_USEC_PER_SEC)
+    return;
+
+  double bps = window_bytes * (double) G_USEC_PER_SEC / elapsed_us;
+  double ups = window_updates * (double) G_USEC_PER_SEC / elapsed_us;
+
+  if (mean_bps < 0.0)
+    {
+      mean_bps = bps;
+      mean_ups = ups;
+    }
+  else
+    {
+      mean_bps = alpha * bps + (1.0 - alpha) * mean_bps;
+      mean_ups = alpha * ups + (1.0 - alpha) * mean_ups;
+    }
+
+  g_message ("rdp: %.1f updates/s (mean %.1f), %.2f MB/s (mean %.2f)",
+             ups, mean_ups,
+             bps / (1024.0 * 1024.0), mean_bps / (1024.0 * 1024.0));
+
+  window_start_us = now_us;
+  window_bytes = 0;
+  window_updates = 0;
+}
+
 static void
 meta_rdp_present_codec (MetaRdpPeerContext *peer_ctx,
                         CoglFramebuffer    *framebuffer,
@@ -257,7 +314,6 @@ meta_rdp_present_codec (MetaRdpPeerContext *peer_ctx,
 {
   freerdp_peer *client = peer_ctx->peer;
   rdpUpdate *update = client->context->update;
-  rdpSettings *settings = client->context->settings;
   int width = cogl_framebuffer_get_width (framebuffer);
   int height = cogl_framebuffer_get_height (framebuffer);
   g_autofree uint8_t *pixels = NULL;
@@ -301,53 +357,45 @@ meta_rdp_present_codec (MetaRdpPeerContext *peer_ctx,
   cmd.bmp.width = rect.width;
   cmd.bmp.height = rect.height;
 
-  if (freerdp_settings_get_bool (settings, FreeRDP_NSCodec) &&
-      peer_ctx->nsc_context && peer_ctx->encode_stream)
-    {
-      Stream_Clear (peer_ctx->encode_stream);
-      Stream_SetPosition (peer_ctx->encode_stream, 0);
+  /* Raw: copy the damage sub-rect tightly, flipping it bottom-up. An
+   * uncompressed SURFACE_BITS bitmap is stored bottom-up, the usual Windows
+   * DIB convention, while the readback above is top-down. */
+  {
+    g_autofree uint8_t *sub = NULL;
+    int y;
 
-      nsc_compose_message (peer_ctx->nsc_context, peer_ctx->encode_stream,
-                           (BYTE *) pixels, rect.width, rect.height,
-                           sub_stride);
+    sub = g_malloc ((size_t) sub_stride * rect.height);
+    for (y = 0; y < rect.height; y++)
+      {
+        memcpy (sub + (size_t) y * sub_stride,
+                pixels + (size_t) (rect.height - 1 - y) * sub_stride,
+                (size_t) sub_stride);
+      }
 
-      cmd.skipCompression = TRUE;
-      cmd.bmp.codecID = freerdp_settings_get_uint32 (settings, FreeRDP_NSCodecId);
-      cmd.bmp.bitmapDataLength = Stream_GetPosition (peer_ctx->encode_stream);
-      cmd.bmp.bitmapData = Stream_Buffer (peer_ctx->encode_stream);
+    cmd.bmp.codecID = 0;
+    cmd.bmp.bitmapDataLength = sub_stride * rect.height;
+    cmd.bmp.bitmapData = sub;
+    g_debug ("rdp: present_codec calling SurfaceBits (raw, %u bytes)",
+             cmd.bmp.bitmapDataLength);
 
-      g_debug ("rdp: present_codec calling SurfaceBits (nsc, %u bytes)",
-                 cmd.bmp.bitmapDataLength);
-      update->SurfaceBits (update->context, &cmd);
-      g_debug ("rdp: present_codec SurfaceBits returned (nsc)");
-    }
-  else
-    {
-      /* Raw: copy the damage sub-rect tightly, flipping it bottom-up.
-       *
-       * An uncompressed SURFACE_BITS bitmap is stored bottom-up, the usual
-       * Windows DIB convention, while the readback above is top-down. The
-       * NSCodec branch needs no flip because nsc_compose_message() already
-       * emits rows in the order the wire expects. */
-      g_autofree uint8_t *sub = NULL;
-      int y;
+    /* SurfaceBits runs on the main loop, so however long it blocks is time the
+     * compositor is not painting or servicing input. */
+    int64_t started_us = g_get_monotonic_time ();
+    update->SurfaceBits (update->context, &cmd);
+    int64_t elapsed_us = g_get_monotonic_time () - started_us;
 
-      sub = g_malloc ((size_t) sub_stride * rect.height);
-      for (y = 0; y < rect.height; y++)
-        {
-          memcpy (sub + (size_t) y * sub_stride,
-                  pixels + (size_t) (rect.height - 1 - y) * sub_stride,
-                  (size_t) sub_stride);
-        }
+    if (elapsed_us > META_RDP_SLOW_UPDATE_US)
+      {
+        g_warning ("rdp: SurfaceBits blocked %.1f ms for %u bytes "
+                   "(%dx%d at %d,%d)",
+                   elapsed_us / 1000.0, cmd.bmp.bitmapDataLength,
+                   rect.width, rect.height, rect.x, rect.y);
+      }
 
-      cmd.bmp.codecID = 0;
-      cmd.bmp.bitmapDataLength = sub_stride * rect.height;
-      cmd.bmp.bitmapData = sub;
-      g_debug ("rdp: present_codec calling SurfaceBits (raw, %u bytes)",
-                 cmd.bmp.bitmapDataLength);
-      update->SurfaceBits (update->context, &cmd);
-      g_debug ("rdp: present_codec SurfaceBits returned (raw)");
-    }
+    g_debug ("rdp: present_codec SurfaceBits returned (raw)");
+
+    meta_rdp_account_update (cmd.bmp.bitmapDataLength);
+  }
 
   g_debug ("rdp: present_codec exit");
 }
