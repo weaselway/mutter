@@ -1631,7 +1631,9 @@ meta_window_wayland_finish_move_resize (MetaWindow              *window,
       string = g_string_new ("");
       g_string_append_printf (string,
                               "Applying window state for wl_surface#%u: ",
-                              wl_resource_get_id (surface->resource));
+                              surface->resource
+                                ? wl_resource_get_id (surface->resource)
+                                : 0);
       g_string_append_printf (string, "size=%dx%d",
                               new_geom.width, new_geom.height);
       if (acked_configuration)
