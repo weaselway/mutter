@@ -217,5 +217,5 @@ option('devkit',
 option('rdp',
   type: 'feature',
   value: 'disabled',
-  description: 'In-process RDP/VAIL output backend'
+  description: 'In-process RDP/VAIL output backend (requires FreeRDP 3.x)'
 )

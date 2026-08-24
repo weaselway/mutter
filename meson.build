@@ -61,6 +61,9 @@ libpipewire_req = '>= 1.6.0'
 # profiler requirements
 sysprof_req = '>= 3.37.2'
 
+# RDP/VAIL backend requirements
+freerdp_req = '>= 3.0.0'
+
 gnome = import('gnome')
 pkg = import('pkgconfig')
 i18n  = import('i18n')
@@ -315,21 +318,26 @@ endif
 
 # In-process RDP/VAIL output backend (WSLg).
 #
-# We always link against the Microsoft FreeRDP fork (freerdp2), built from
-# vendor/FreeRDP into our install prefix by build-freerdp.sh and found via
-# PKG_CONFIG_PATH. That fork ships the gfxredir *server* channel that the VAIL
-# fast path needs; stock upstream FreeRDP does not build those symbols.
+# We link against upstream FreeRDP 3.x. The gfxredir server channel that the
+# VAIL fast path needs is built only when FreeRDP is configured with
+# -DCHANNEL_GFXREDIR=ON (it defaults to OFF upstream), so probe for the header
+# rather than assuming it is present.
 have_rdp = get_option('rdp').enabled()
 have_gfxredir = false
 if have_rdp
-  freerdp_dep = dependency('freerdp2', version: '>= 2.2.0', required: get_option('rdp'))
-  freerdp_server_dep = dependency('freerdp-server2', version: '>= 2.2.0',
+  freerdp_dep = dependency('freerdp3', version: freerdp_req,
     required: get_option('rdp'))
-  winpr_dep = dependency('winpr2', version: '>= 2.2.0', required: get_option('rdp'))
+  freerdp_server_dep = dependency('freerdp-server3', version: freerdp_req,
+    required: get_option('rdp'))
+  winpr_dep = dependency('winpr3', version: freerdp_req,
+    required: get_option('rdp'))
   rdp_deps = [freerdp_dep, freerdp_server_dep, winpr_dep]
-  # The gfxredir/VAIL fast path needs the microsoft/FreeRDP-mirror header
-  # freerdp/server/gfxredir.h plus the matching server symbols.
-  have_gfxredir = cc.has_header('freerdp/server/gfxredir.h',
+  # freerdp/server/gfxredir.h is installed unconditionally, but the matching
+  # server symbols only exist when the channel was enabled at FreeRDP build
+  # time. Probe the constructor so a header-only hit does not turn into a link
+  # failure; without it we fall back to the NSCodec present path.
+  have_gfxredir = cc.has_function('gfxredir_server_context_new',
+    prefix: '#include <freerdp/server/gfxredir.h>',
     dependencies: freerdp_server_dep)
 endif
 

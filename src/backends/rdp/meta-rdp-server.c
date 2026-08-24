@@ -10,8 +10,8 @@
  * negotiates TLS, activates, and the session stays up. Screen stays black.
  *
  * Ported (with RAIL/audio/clipboard stripped) from
- * wslg/weston/libweston/backend-rdp/rdp.c on the Microsoft `working` fork
- * (FreeRDP 2.4.0). Weston's wl_event_loop fd wiring is replaced with GSources
+ * wslg/weston/libweston/backend-rdp/rdp.c, and since migrated to the upstream
+ * FreeRDP 3.x server API. Weston's wl_event_loop fd wiring is replaced with GSources
  * attached to mutter's default GMainContext; everything runs single-threaded on
  * mutter's main thread.
  */
@@ -46,6 +46,8 @@
 
 #include <freerdp/freerdp.h>
 #include <freerdp/codec/nsc.h>
+#include <freerdp/crypto/certificate.h>
+#include <freerdp/crypto/privatekey.h>
 #include <freerdp/update.h>
 #include <freerdp/listener.h>
 #include <freerdp/peer.h>
@@ -58,14 +60,19 @@
 #include <winpr/synch.h>
 #include <winpr/wtsapi.h>
 
-#ifdef HAVE_FREERDP_GFXREDIR_H
 #include <freerdp/server/gfxredir.h>
-#endif
+#include <freerdp/channels/drdynvc.h>
 #include <freerdp/server/drdynvc.h>
 
 /* From Weston's rdp.c: an upper bound on the number of FreeRDP event handles
  * (listener or per-peer, +1 for the virtual channel manager). */
 #define META_RDP_MAX_FREERDP_FDS 32
+
+/* Watched sources per peer: the peer's own handles, +1 for the virtual channel
+ * manager and +1 for the CLIPRDR event handle (which Weston does not watch
+ * separately -- it runs cliprdr threaded via Start(), we drive it from the main
+ * loop instead). */
+#define META_RDP_MAX_PEER_FD_SOURCES (META_RDP_MAX_FREERDP_FDS + 2)
 
 #define META_RDP_DEFAULT_TCP_PORT 3389
 
@@ -97,7 +104,7 @@ typedef struct _MetaRdpPeerContext
   HANDLE vcm;
 
   /* GSources bridging this peer's FreeRDP fds into the GLib main loop. */
-  GSource *fd_sources[META_RDP_MAX_FREERDP_FDS];
+  GSource *fd_sources[META_RDP_MAX_PEER_FD_SOURCES];
   int n_fd_sources;
 
   gboolean activated;
@@ -108,6 +115,9 @@ typedef struct _MetaRdpPeerContext
 
   /* CLIPRDR clipboard bridge, created on first activation. */
   MetaRdpClipboard *clipboard;
+  /* Aliases the fd_sources[] entry watching the cliprdr event handle, so the
+   * source can be torn down together with the bridge (the fd dies with it). */
+  GSource *clipboard_fd_source;
 
   /* Debounced pointer button state, indexed by (button - BTN_LEFT). */
   gboolean button_state[8];
@@ -127,7 +137,6 @@ typedef struct _MetaRdpPeerContext
    * opening DVCs such as gfxredir. */
   DrdynvcServerContext *drdynvc;
 
-#ifdef HAVE_FREERDP_GFXREDIR_H
   /* Fast path: gfxredir shared-memory present. */
   GfxRedirServerContext *gfxredir;
   gboolean gfxredir_activated; /* caps confirmed */
@@ -149,7 +158,6 @@ typedef struct _MetaRdpPeerContext
   gboolean update_pending;
   gboolean frame_missed; /* a frame arrived while a present was pending */
   uint64_t current_frame_id;
-#endif /* HAVE_FREERDP_GFXREDIR_H */
 
   GList *link; /* node in server->peers */
 } MetaRdpPeerContext;
@@ -285,12 +293,16 @@ meta_rdp_present_codec (MetaRdpPeerContext *peer_ctx,
   if (rect.width <= 0 || rect.height <= 0)
     return;
 
+  g_message ("rdp: present_codec enter rect=%d,%d %dx%d", rect.x, rect.y, rect.width, rect.height);
+
   pixels = g_malloc ((size_t) stride * height);
   if (!meta_rdp_read_framebuffer (framebuffer, pixels, width, height, stride))
     {
       g_warning ("rdp: framebuffer readback failed (codec path)");
       return;
     }
+
+  g_message ("rdp: present_codec readback done");
 
   cmd.cmdType = CMDTYPE_SET_SURFACE_BITS;
   cmd.destLeft = rect.x;
@@ -301,7 +313,8 @@ meta_rdp_present_codec (MetaRdpPeerContext *peer_ctx,
   cmd.bmp.width = rect.width;
   cmd.bmp.height = rect.height;
 
-  if (settings->NSCodec && peer_ctx->nsc_context && peer_ctx->encode_stream)
+  if (freerdp_settings_get_bool (settings, FreeRDP_NSCodec) &&
+      peer_ctx->nsc_context && peer_ctx->encode_stream)
     {
       const uint8_t *ptr = pixels + (size_t) rect.y * stride + rect.x * 4;
 
@@ -312,11 +325,14 @@ meta_rdp_present_codec (MetaRdpPeerContext *peer_ctx,
                            (BYTE *) ptr, rect.width, rect.height, stride);
 
       cmd.skipCompression = TRUE;
-      cmd.bmp.codecID = settings->NSCodecId;
+      cmd.bmp.codecID = freerdp_settings_get_uint32 (settings, FreeRDP_NSCodecId);
       cmd.bmp.bitmapDataLength = Stream_GetPosition (peer_ctx->encode_stream);
       cmd.bmp.bitmapData = Stream_Buffer (peer_ctx->encode_stream);
 
+      g_message ("rdp: present_codec calling SurfaceBits (nsc, %u bytes)",
+                 cmd.bmp.bitmapDataLength);
       update->SurfaceBits (update->context, &cmd);
+      g_message ("rdp: present_codec SurfaceBits returned (nsc)");
     }
   else
     {
@@ -335,11 +351,15 @@ meta_rdp_present_codec (MetaRdpPeerContext *peer_ctx,
       cmd.bmp.codecID = 0;
       cmd.bmp.bitmapDataLength = rect.width * rect.height * 4;
       cmd.bmp.bitmapData = sub;
+      g_message ("rdp: present_codec calling SurfaceBits (raw, %u bytes)",
+                 cmd.bmp.bitmapDataLength);
       update->SurfaceBits (update->context, &cmd);
+      g_message ("rdp: present_codec SurfaceBits returned (raw)");
     }
+
+  g_message ("rdp: present_codec exit");
 }
 
-#ifdef HAVE_FREERDP_GFXREDIR_H
 /* ---- gfxredir shared-memory fast path ---- */
 
 static void
@@ -593,7 +613,6 @@ meta_rdp_present_gfxredir (MetaRdpPeerContext *peer_ctx,
       g_warning ("rdp: gfxredir PresentBuffer failed");
     }
 }
-#endif /* HAVE_FREERDP_GFXREDIR_H */
 
 /* Present the current frame to one peer, choosing fast path or fallback. */
 static void
@@ -602,9 +621,12 @@ meta_rdp_peer_present (MetaRdpPeerContext *peer_ctx,
                        const MtkRectangle *damage)
 {
   if (!peer_ctx->activated)
-    return;
+    {
+      g_message ("rdp: meta_rdp_peer_present: peer %p not activated, skipping",
+                 peer_ctx->peer);
+      return;
+    }
 
-#ifdef HAVE_FREERDP_GFXREDIR_H
   if (peer_ctx->use_gfxredir)
     {
       if (!peer_ctx->gfxredir_activated)
@@ -618,7 +640,6 @@ meta_rdp_peer_present (MetaRdpPeerContext *peer_ctx,
       meta_rdp_present_gfxredir (peer_ctx, framebuffer, damage);
       return;
     }
-#endif
 
   meta_rdp_present_codec (peer_ctx, framebuffer, damage);
 }
@@ -631,6 +652,8 @@ meta_rdp_peer_force_full_present (MetaRdpPeerContext *peer_ctx)
 {
   MetaRdpServer *self = peer_ctx->server;
   GList *l;
+
+  g_message ("rdp: force_full_present enter peer=%p", peer_ctx->peer);
 
   for (l = self->watched_views; l; l = l->next)
     {
@@ -645,9 +668,13 @@ meta_rdp_peer_force_full_present (MetaRdpPeerContext *peer_ctx)
       full = (MtkRectangle) { 0, 0,
                               cogl_framebuffer_get_width (fb),
                               cogl_framebuffer_get_height (fb) };
+      g_message ("rdp: force_full_present calling meta_rdp_peer_present");
       meta_rdp_peer_present (peer_ctx, fb, &full);
+      g_message ("rdp: force_full_present meta_rdp_peer_present returned");
       break;
     }
+
+  g_message ("rdp: force_full_present exit");
 }
 
 static void
@@ -664,6 +691,8 @@ on_frame_ready (MetaStage        *stage,
   MtkRectangle damage;
   GList *l;
 
+  g_message ("rdp: on_frame_ready enter view=%p", view);
+
   framebuffer = clutter_stage_view_get_framebuffer (view);
   width = cogl_framebuffer_get_width (framebuffer);
   height = cogl_framebuffer_get_height (framebuffer);
@@ -676,7 +705,13 @@ on_frame_ready (MetaStage        *stage,
   self->frame_counter++;
 
   for (l = self->peers; l; l = l->next)
-    meta_rdp_peer_present (l->data, framebuffer, &damage);
+    {
+      g_message ("rdp: on_frame_ready presenting to peer %p", l->data);
+      meta_rdp_peer_present (l->data, framebuffer, &damage);
+      g_message ("rdp: on_frame_ready present to peer %p returned", l->data);
+    }
+
+  g_message ("rdp: on_frame_ready exit");
 }
 
 static void meta_rdp_server_detach_views (MetaRdpServer *self);
@@ -778,6 +813,9 @@ typedef struct _MetaRdpFdSource
   gpointer fd_tag;
   MetaRdpFdCheck check;
   gpointer data;
+  int fd;
+  const char *label;
+  guint64 dispatch_count;
 } MetaRdpFdSource;
 
 static gboolean
@@ -789,10 +827,18 @@ meta_rdp_fd_source_dispatch (GSource     *source,
   GIOCondition revents;
 
   revents = g_source_query_unix_fd (source, fd_source->fd_tag);
+
+    g_message ("rdp: fd source %s (fd %d) dispatch #%" G_GUINT64_FORMAT
+                " revents=0x%x",
+                fd_source->label, fd_source->fd,
+                fd_source->dispatch_count, (unsigned int) revents);
+
   if (revents & (G_IO_IN | G_IO_HUP | G_IO_ERR))
     {
-      if (!fd_source->check (fd_source->data))
+      if (!fd_source->check (fd_source->data)) {
+          g_message("rdp: remove fd %d", fd_source->fd);
         return G_SOURCE_REMOVE;
+      }
     }
 
   return G_SOURCE_CONTINUE;
@@ -805,7 +851,8 @@ static GSourceFuncs meta_rdp_fd_source_funcs = {
 static GSource *
 meta_rdp_add_fd_source (int             fd,
                         MetaRdpFdCheck  check,
-                        gpointer        data)
+                        gpointer        data,
+                        const char     *label)
 {
   GSource *source;
   MetaRdpFdSource *fd_source;
@@ -814,8 +861,12 @@ meta_rdp_add_fd_source (int             fd,
   fd_source = (MetaRdpFdSource *) source;
   fd_source->check = check;
   fd_source->data = data;
+  fd_source->fd = fd;
+  fd_source->label = label;
   fd_source->fd_tag =
     g_source_add_unix_fd (source, fd, G_IO_IN | G_IO_HUP | G_IO_ERR);
+
+  g_message ("rdp: watching fd %d (%s)", fd, label);
 
   g_source_set_name (source, "[mutter] RDP fd");
   g_source_attach (source, NULL);
@@ -844,6 +895,32 @@ meta_rdp_peer_remove_fd_sources (MetaRdpPeerContext *peer_ctx)
   peer_ctx->n_fd_sources = 0;
 }
 
+/* Tear down the CLIPRDR bridge *and* the main-loop source watching its event
+ * handle. Freeing the bridge closes that fd, so leaving the GSource attached
+ * would leave us polling a dead descriptor: poll() reports POLLNVAL, which our
+ * dispatch mask ignores, so the source stays ready forever and the main loop
+ * spins without ever sleeping (and the fd number can later be recycled by an
+ * unrelated open(), giving spurious wakeups on someone else's socket). */
+static void
+meta_rdp_peer_clear_clipboard (MetaRdpPeerContext *peer_ctx)
+{
+  int i;
+
+  if (peer_ctx->clipboard_fd_source)
+    {
+      for (i = 0; i < peer_ctx->n_fd_sources; i++)
+        {
+          if (peer_ctx->fd_sources[i] == peer_ctx->clipboard_fd_source)
+            peer_ctx->fd_sources[i] = NULL;
+        }
+
+      g_source_destroy (peer_ctx->clipboard_fd_source);
+      peer_ctx->clipboard_fd_source = NULL;
+    }
+
+  g_clear_pointer (&peer_ctx->clipboard, meta_rdp_clipboard_free);
+}
+
 static void
 meta_rdp_peer_destroy (MetaRdpPeerContext *peer_ctx)
 {
@@ -861,7 +938,6 @@ meta_rdp_peer_destroy (MetaRdpPeerContext *peer_ctx)
   freerdp_peer_free (peer);
 }
 
-#ifdef HAVE_FREERDP_GFXREDIR_H
 /* ---- gfxredir caps negotiation callbacks (ported from rdprail.c) ---- */
 
 static UINT
@@ -971,6 +1047,8 @@ meta_rdp_ensure_drdynvc (MetaRdpPeerContext *peer_ctx)
   if (peer_ctx->drdynvc)
     return TRUE;
 
+  g_message("rdp: meta_rdp_ensure_drdynvc with vcm: %p", peer_ctx->vcm);
+
   if (!peer_ctx->vcm)
     return FALSE;
 
@@ -991,9 +1069,13 @@ meta_rdp_ensure_drdynvc (MetaRdpPeerContext *peer_ctx)
   peer_ctx->drdynvc = drdynvc;
 
   /* Force the dynamic virtual channel to exchange caps and reach READY before
-   * any DVC (e.g. gfxredir) is opened. Ported from Weston's rdp_drdynvc_init. */
-  if (WTSVirtualChannelManagerGetDrdynvcState (peer_ctx->vcm) ==
-      DRDYNVC_STATE_NONE)
+   * any DVC (e.g. gfxredir) is opened. Ported from Weston's rdp_drdynvc_init.
+   *
+   * FreeRDP 2 only had DRDYNVC_STATE_NONE before READY; 3.x adds intermediate
+   * states (INITIALIZED, ...), so pump until READY rather than keying off NONE.
+   */
+  if (WTSVirtualChannelManagerGetDrdynvcState (peer_ctx->vcm) !=
+      DRDYNVC_STATE_READY)
     {
       client->activated = TRUE;
       while (WTSVirtualChannelManagerGetDrdynvcState (peer_ctx->vcm) !=
@@ -1005,8 +1087,21 @@ meta_rdp_ensure_drdynvc (MetaRdpPeerContext *peer_ctx)
               return FALSE;
             }
           g_usleep (10000); /* 0.01s */
-          client->CheckFileDescriptor (client);
-          WTSVirtualChannelManagerCheckFileDescriptor (peer_ctx->vcm);
+          if (!client->CheckFileDescriptor (client))
+            {
+              g_warning ("rdp: peer died while waiting for drdynvc");
+              return FALSE;
+            }
+          /* FreeRDP 3 asserts if CheckFileDescriptor runs before the client
+           * has joined drdynvc. */
+          if (!WTSVirtualChannelManagerIsChannelJoined (peer_ctx->vcm,
+                                                        DRDYNVC_SVC_CHANNEL_NAME))
+            continue;
+          if (!WTSVirtualChannelManagerCheckFileDescriptor (peer_ctx->vcm))
+            {
+              g_warning ("rdp: WTS VC check failed while waiting for drdynvc");
+              return FALSE;
+            }
         }
     }
 
@@ -1017,7 +1112,9 @@ static void
 meta_rdp_setup_gfxredir (MetaRdpPeerContext *peer_ctx)
 {
   MetaRdpServer *self = peer_ctx->server;
-  GfxRedirServerContext *redir;
+  GfxRedirServerContext *redir = NULL;
+
+  g_message("rdp: meta_rdp_setup_gfxredir called");
 
   if (!self->shared_memory_mount_path)
     {
@@ -1025,20 +1122,9 @@ meta_rdp_setup_gfxredir (MetaRdpPeerContext *peer_ctx)
       return;
     }
 
-  if (!peer_ctx->vcm)
-    {
-      g_warning ("rdp: no vcm; cannot set up gfxredir");
-      return;
-    }
+  // FIXME
+  // redir = gfxredir_server_context_new (peer_ctx->vcm);
 
-  /* gfxredir is a dynamic virtual channel; drdynvc must be READY first. */
-  if (!meta_rdp_ensure_drdynvc (peer_ctx))
-    {
-      g_warning ("rdp: drdynvc not ready; using codec fallback path");
-      return;
-    }
-
-  redir = gfxredir_server_context_new (peer_ctx->vcm);
   if (!redir)
     {
       g_warning ("rdp: gfxredir_server_context_new failed");
@@ -1053,7 +1139,8 @@ meta_rdp_setup_gfxredir (MetaRdpPeerContext *peer_ctx)
   if (redir->Open (redir) != CHANNEL_RC_OK)
     {
       g_warning ("rdp: gfxredir Open failed");
-      gfxredir_server_context_free (redir);
+      // FIXME
+      // gfxredir_server_context_free (redir);
       return;
     }
 
@@ -1071,8 +1158,9 @@ meta_rdp_setup_gfxredir (MetaRdpPeerContext *peer_ctx)
       {
         wait_retry++;
         g_usleep (10000);
-        client->CheckFileDescriptor (client);
-        WTSVirtualChannelManagerCheckFileDescriptor (peer_ctx->vcm);
+        if (!client->CheckFileDescriptor (client) ||
+            !WTSVirtualChannelManagerCheckFileDescriptor (peer_ctx->vcm))
+          break;
       }
 
     if (peer_ctx->gfxredir_activated)
@@ -1083,7 +1171,6 @@ meta_rdp_setup_gfxredir (MetaRdpPeerContext *peer_ctx)
                  "(client likely does not support gfxredir in this mode)");
   }
 }
-#endif /* HAVE_FREERDP_GFXREDIR_H */
 
 /* ------------------------------------------------------------------ */
 /* Task 05: input injection (RDP keyboard/mouse -> clutter virtual devices) */
@@ -1237,11 +1324,17 @@ meta_rdp_apply_keymap (MetaRdpServer *self,
   const char *layout = NULL;
   const char *variant = NULL;
   g_autoptr (MetaKeymapDescription) description = NULL;
+  uint32_t keyboard_layout =
+    freerdp_settings_get_uint32 (settings, FreeRDP_KeyboardLayout);
+  uint32_t keyboard_type =
+    freerdp_settings_get_uint32 (settings, FreeRDP_KeyboardType);
+  uint32_t keyboard_sub_type =
+    freerdp_settings_get_uint32 (settings, FreeRDP_KeyboardSubType);
   int i;
 
   for (i = 0; rdp_keyboards[i].rdpLayoutCode; i++)
     {
-      if (rdp_keyboards[i].rdpLayoutCode == settings->KeyboardLayout)
+      if (rdp_keyboards[i].rdpLayoutCode == keyboard_layout)
         {
           layout = rdp_keyboards[i].xkbLayout;
           variant = rdp_keyboards[i].xkbVariant;
@@ -1250,17 +1343,15 @@ meta_rdp_apply_keymap (MetaRdpServer *self,
     }
 
   /* Korean keyboard support (KeyboardType 8, LangID 0x412). */
-  if (settings->KeyboardType == 8 &&
-      (settings->KeyboardLayout & 0xFFFF) == 0x412)
+  if (keyboard_type == 8 && (keyboard_layout & 0xFFFF) == 0x412)
     {
-      if (settings->KeyboardSubType == 0 || settings->KeyboardSubType == 3)
+      if (keyboard_sub_type == 0 || keyboard_sub_type == 3)
         variant = "kr104";
-      else if (settings->KeyboardSubType == 6)
+      else if (keyboard_sub_type == 6)
         variant = "kr106";
     }
   /* Japanese layout with non-Japanese keyboard falls back to "us". */
-  else if (settings->KeyboardType != 7 &&
-           (settings->KeyboardLayout & 0xFFFF) == 0x411)
+  else if (keyboard_type != 7 && (keyboard_layout & 0xFFFF) == 0x411)
     {
       layout = "us";
       variant = NULL;
@@ -1269,12 +1360,12 @@ meta_rdp_apply_keymap (MetaRdpServer *self,
   if (!layout)
     {
       g_message ("rdp: no xkb layout for RDP layout 0x%x; keeping default",
-                 settings->KeyboardLayout);
+                 keyboard_layout);
       return;
     }
 
   g_message ("rdp: keyboard layout 0x%x -> xkb model=pc105 layout=%s variant=%s",
-             settings->KeyboardLayout, layout, variant ? variant : "(none)");
+             keyboard_layout, layout, variant ? variant : "(none)");
 
   description = meta_keymap_description_new_from_rules ("pc105", layout, variant,
                                                        NULL, NULL, NULL);
@@ -1484,37 +1575,33 @@ meta_rdp_extended_mouse_event (rdpInput *input,
 static BOOL
 meta_rdp_keyboard_event (rdpInput *input,
                          UINT16    flags,
-                         UINT16    code)
+                         UINT8     code)
 {
   MetaRdpPeerContext *peer_ctx = (MetaRdpPeerContext *) input->context;
   freerdp_peer *client = input->context->peer;
   rdpSettings *settings = client->context->settings;
+  uint32_t keyboard_type =
+    freerdp_settings_get_uint32 (settings, FreeRDP_KeyboardType);
   uint32_t scan_code, vk_code, full_code, keyboard_locale;
   ClutterKeyState key_state;
   gboolean send_release_key = FALSE;
-  gboolean notify = FALSE;
 
   if (!peer_ctx->activated)
     return TRUE;
 
-  if (flags & KBD_FLAGS_DOWN)
-    {
-      key_state = CLUTTER_KEY_STATE_PRESSED;
-      notify = TRUE;
-    }
-  else if (flags & KBD_FLAGS_RELEASE)
-    {
-      key_state = CLUTTER_KEY_STATE_RELEASED;
-      notify = TRUE;
-    }
-
-  if (!notify)
-    return TRUE;
+  /* KBD_FLAGS_DOWN no longer means "key press" in FreeRDP 3 -- it flags a
+   * repeat of an already-down key. Absence of KBD_FLAGS_RELEASE is what
+   * denotes a press. */
+  if (flags & KBD_FLAGS_RELEASE)
+    key_state = CLUTTER_KEY_STATE_RELEASED;
+  else
+    key_state = CLUTTER_KEY_STATE_PRESSED;
 
   full_code = code;
   /* Windows 10 reports extended bit for right shift (0x36) under certain
    * locales due to a bug; drop it. */
-  keyboard_locale = settings->KeyboardLayout & 0xFFFF;
+  keyboard_locale =
+    freerdp_settings_get_uint32 (settings, FreeRDP_KeyboardLayout) & 0xFFFF;
   if (code == 0x36 &&
       (keyboard_locale == KBD_CHINESE_TRADITIONAL_US ||
        keyboard_locale == KBD_CHINESE_SIMPLIFIED_US ||
@@ -1530,7 +1617,8 @@ meta_rdp_keyboard_event (rdpInput *input,
   /* Korean HANJA/HANGEUL keys have no release event; synthesize one. */
 #define ATKBD_RET_HANJA 0xf1
 #define ATKBD_RET_HANGEUL 0xf2
-  if (settings->KeyboardType == 8 && settings->KeyboardSubType == 6 &&
+  if (keyboard_type == 8 &&
+      freerdp_settings_get_uint32 (settings, FreeRDP_KeyboardSubType) == 6 &&
       (full_code == (KBD_FLAGS_EXTENDED | ATKBD_RET_HANJA) ||
        full_code == (KBD_FLAGS_EXTENDED | ATKBD_RET_HANGEUL)))
     {
@@ -1542,15 +1630,14 @@ meta_rdp_keyboard_event (rdpInput *input,
     }
   else
     {
-      vk_code = GetVirtualKeyCodeFromVirtualScanCode (full_code,
-                                                      settings->KeyboardType);
+      vk_code = GetVirtualKeyCodeFromVirtualScanCode (full_code, keyboard_type);
     }
 
   if (vk_code != VK_HANGUL && vk_code != VK_HANJA)
     if (flags & KBD_FLAGS_EXTENDED)
       vk_code |= KBDEXT;
 
-  scan_code = GetKeycodeFromVirtualKeyCode (vk_code, KEYCODE_TYPE_EVDEV);
+  scan_code = GetKeycodeFromVirtualKeyCode (vk_code, WINPR_KEYCODE_TYPE_XKB);
 
   meta_rdp_ensure_virtual_keyboard (peer_ctx);
 
@@ -1616,24 +1703,40 @@ xf_peer_activate (freerdp_peer *client)
              "SurfaceCommands=%d, RemoteFxCodec=%d, NSCodec=%d, "
              "GfxPipeline=%d",
              client,
-             settings->DesktopWidth, settings->DesktopHeight,
-             settings->ColorDepth,
-             settings->SurfaceCommandsEnabled,
-             settings->RemoteFxCodec,
-             settings->NSCodec,
-             settings->SupportGraphicsPipeline);
+             freerdp_settings_get_uint32 (settings, FreeRDP_DesktopWidth),
+             freerdp_settings_get_uint32 (settings, FreeRDP_DesktopHeight),
+             freerdp_settings_get_uint32 (settings, FreeRDP_ColorDepth),
+             freerdp_settings_get_bool (settings, FreeRDP_SurfaceCommandsEnabled),
+             freerdp_settings_get_bool (settings, FreeRDP_RemoteFxCodec),
+             freerdp_settings_get_bool (settings, FreeRDP_NSCodec),
+             freerdp_settings_get_bool (settings, FreeRDP_SupportGraphicsPipeline));
 
-  if (!settings->SurfaceCommandsEnabled)
+  if (!freerdp_settings_get_bool (settings, FreeRDP_SurfaceCommandsEnabled))
     {
       g_warning ("rdp: client doesn't support required SurfaceCommands");
       return FALSE;
     }
 
-  /* Task 03 deliverable: session stays up, screen stays black. We just log the
-   * requested resolution here. Resizing the virtual monitor to the client's
-   * DesktopWidth/Height is deferred (task 02 already created a fixed-size
-   * virtual monitor via --virtual-monitor; resize is a follow-up). If the
-   * sizes differ we simply keep our own and let the client scale. */
+  /* Weston's xf_peer_activate brings the virtual channels up first, on every
+   * activation, and only then falls through to the once-per-peer setup. Keep
+   * that order: the drdynvc handshake below busy-pumps the peer, and anything
+   * opened before it (notably CLIPRDR) would queue PDUs that nothing drains
+   * until the handshake finishes. */
+  if (!peer_ctx->vcm)
+    {
+      g_warning ("rdp: virtual channel manager is required for clipboard "
+                 "and gfxredir");
+      return FALSE;
+    }
+
+  /* gfxredir is a dynamic virtual channel; drdynvc must be READY first. */
+  if (!meta_rdp_ensure_drdynvc (peer_ctx))
+    {
+      g_warning ("rdp: drdynvc not ready");
+      return FALSE;
+    }
+
+  /* Everything past here is first-activation-only setup. */
   if (peer_ctx->activated)
     return TRUE;
 
@@ -1643,8 +1746,9 @@ xf_peer_activate (freerdp_peer *client)
   /* Sync the xkb layout to the client's reported RDP keyboard layout. */
   meta_rdp_apply_keymap (peer_ctx->server, settings);
 
-  /* Bridge the clipboard (CLIPRDR is a static channel; no drdynvc needed). */
-  if (peer_ctx->vcm && !peer_ctx->clipboard)
+  /* Bridge the clipboard. CLIPRDR is a static channel, but Weston initialises
+   * it last -- after drdynvc and the seat -- so do the same. */
+  if (!peer_ctx->clipboard)
     {
       peer_ctx->clipboard = meta_rdp_clipboard_new (client,
                                                     peer_ctx->server->backend,
@@ -1656,23 +1760,26 @@ xf_peer_activate (freerdp_peer *client)
           int fd = h ? GetEventFileDescriptor (h) : -1;
 
           if (fd >= 0 &&
-              peer_ctx->n_fd_sources < META_RDP_MAX_FREERDP_FDS)
+              peer_ctx->n_fd_sources < META_RDP_MAX_PEER_FD_SOURCES)
             {
-              peer_ctx->fd_sources[peer_ctx->n_fd_sources++] =
-                meta_rdp_add_fd_source (fd, rdp_client_activity, client);
+              GSource *source =
+                meta_rdp_add_fd_source (fd, rdp_client_activity, client,
+                                        "cliprdr");
+
+              peer_ctx->fd_sources[peer_ctx->n_fd_sources++] = source;
+              peer_ctx->clipboard_fd_source = source;
             }
         }
     }
 
-#ifdef HAVE_FREERDP_GFXREDIR_H
   meta_rdp_setup_gfxredir (peer_ctx);
+
   if (peer_ctx->use_gfxredir)
     {
       /* gfxredir isn't ready yet; the full present is forced from
        * gfxredir_caps_advertise() once caps are confirmed. */
       return TRUE;
     }
-#endif
 
   /* Codec fallback: fill the screen now. */
   meta_rdp_peer_force_full_present (peer_ctx);
@@ -1692,9 +1799,33 @@ rdp_client_activity (gpointer data)
       goto out_clean;
     }
 
-  if (peer_ctx->vcm)
+  /* The VCM must be pumped unconditionally: its event handle stays signalled
+   * until CheckFileDescriptor() drains it, so skipping the call leaves the fd
+   * permanently readable and spins the main loop. It is also what demultiplexes
+   * static channel data (CLIPRDR), which arrives long before drdynvc matters.
+   *
+   * What *is* conditional is auto-opening drdynvc. FreeRDP 2 gated that on
+   * client->activated internally; FreeRDP 3 keys it only off drdynvc_state, so
+   * an unconditional open would push DVC capability PDUs onto a virtual channel
+   * while the client still awaits the license PDU on the global channel
+   * ("unexpected message for channel 1006, expected 1003"). It also asserts if
+   * drdynvc has not been joined. Re-apply both gates via the autoOpen argument.
+   */
+  if (peer_ctx && peer_ctx->vcm)
     {
-      if (!WTSVirtualChannelManagerCheckFileDescriptor (peer_ctx->vcm))
+      /* NOTE: this deliberately diverges from Weston, which guards the pump
+       * with WTSVirtualChannelManagerIsChannelJoined(vcm, "drdynvc") and then
+       * calls the plain CheckFileDescriptor(). That guard does not work on
+       * FreeRDP 3: MCS channel join completes *before* licensing, so the guard
+       * is already TRUE while the client is still waiting for the license PDU,
+       * and the unconditional auto-open pushes DVC caps onto a static virtual
+       * channel. Gate on activation instead. Weston needs the same fix. */
+      BOOL auto_open = client->activated &&
+                       WTSVirtualChannelManagerIsChannelJoined (peer_ctx->vcm,
+                                                                DRDYNVC_SVC_CHANNEL_NAME);
+
+      if (!WTSVirtualChannelManagerCheckFileDescriptorEx (peer_ctx->vcm,
+                                                          auto_open))
         {
           g_message ("rdp: WTS VC CheckFileDescriptor failed for peer %p",
                      client);
@@ -1702,15 +1833,16 @@ rdp_client_activity (gpointer data)
         }
     }
 
-  if (peer_ctx->clipboard)
-    {
-      if (!meta_rdp_clipboard_check_event_handle (peer_ctx->clipboard))
-        {
-          g_message ("rdp: clipboard CheckEventHandle failed for peer %p",
-                     client);
-          goto out_clean;
-        }
-    }
+   if (peer_ctx->clipboard)
+     {
+       /* A clipboard protocol error is not worth dropping the whole session
+        * over: tear down just the CLIPRDR bridge and keep the peer alive. */
+       if (!meta_rdp_clipboard_check_event_handle (peer_ctx->clipboard))
+         {
+           g_warning ("rdp: disabling clipboard bridge for peer %p", client);
+           meta_rdp_peer_clear_clipboard (peer_ctx);
+         }
+     }
 
   return TRUE;
 
@@ -1737,9 +1869,7 @@ rdp_peer_context_new (freerdp_peer *client, rdpContext *context)
       peer_ctx->encode_stream = Stream_New (NULL, 65536);
     }
 
-#ifdef HAVE_FREERDP_GFXREDIR_H
   peer_ctx->shm_fd = -1;
-#endif
 
   return TRUE;
 }
@@ -1757,17 +1887,21 @@ rdp_peer_context_free (freerdp_peer *client, rdpContext *context)
   g_clear_object (&peer_ctx->virtual_pointer);
   g_clear_object (&peer_ctx->virtual_keyboard);
 
-  g_clear_pointer (&peer_ctx->clipboard, meta_rdp_clipboard_free);
+  /* remove_fd_sources() above already dropped the clipboard's source; clear the
+   * alias so the helper does not touch a destroyed GSource. */
+  peer_ctx->clipboard_fd_source = NULL;
+  meta_rdp_peer_clear_clipboard (peer_ctx);
 
-#ifdef HAVE_FREERDP_GFXREDIR_H
   meta_rdp_destroy_buffer (peer_ctx);
   if (peer_ctx->gfxredir)
     {
       peer_ctx->gfxredir->Close (peer_ctx->gfxredir);
-      gfxredir_server_context_free (peer_ctx->gfxredir);
+
+      // FIXME
+      // gfxredir_server_context_free (peer_ctx->gfxredir);
+
       peer_ctx->gfxredir = NULL;
     }
-#endif
 
   if (peer_ctx->drdynvc)
     {
@@ -1820,19 +1954,57 @@ rdp_peer_init (freerdp_peer *client, MetaRdpServer *self)
   settings = client->context->settings;
 
   /* TLS: use the throwaway self-signed pair we generated at startup. NLA is
-   * disabled to match wslg_desktop.rdp (authentication level:i:0). */
+   * disabled to match wslg_desktop.rdp (authentication level:i:0).
+   *
+   * FreeRDP 3 removed settings->{Certificate,PrivateKey}File; the cert and key
+   * are now first-class objects handed to the settings as pointers. */
   if (self->cert_file && self->key_file)
     {
-      settings->CertificateFile = strdup (self->cert_file);
-      settings->PrivateKeyFile = strdup (self->key_file);
-      settings->TlsSecurity = TRUE;
+      rdpPrivateKey *key = freerdp_key_new_from_file (self->key_file);
+      rdpCertificate *cert = freerdp_certificate_new_from_file (self->cert_file);
+
+      if (!key || !cert)
+        {
+          g_warning ("rdp: failed to load TLS cert/key (%s, %s)",
+                     self->cert_file, self->key_file);
+          freerdp_key_free (key);
+          freerdp_certificate_free (cert);
+          goto error;
+        }
+
+      /* Unlike most FreeRDP_* pointer keys, RdpServerRsaKey and
+       * RdpServerCertificate take ownership of the pointer rather than cloning
+       * it -- freeing them here would leave the settings dangling and, among
+       * other things, make the RSA-2048 probe that gates standard RDP security
+       * read freed memory. */
+      if (!freerdp_settings_set_pointer_len (settings, FreeRDP_RdpServerRsaKey,
+                                             key, 1))
+        {
+          g_warning ("rdp: failed to apply TLS key to peer settings");
+          freerdp_key_free (key);
+          freerdp_certificate_free (cert);
+          goto error;
+        }
+
+      if (!freerdp_settings_set_pointer_len (settings,
+                                             FreeRDP_RdpServerCertificate,
+                                             cert, 1))
+        {
+          g_warning ("rdp: failed to apply TLS cert to peer settings");
+          freerdp_certificate_free (cert);
+          goto error;
+        }
+
+      (void) freerdp_settings_set_bool (settings, FreeRDP_TlsSecurity, TRUE);
     }
   else
     {
-      settings->TlsSecurity = FALSE;
+      (void) freerdp_settings_set_bool (settings, FreeRDP_TlsSecurity, FALSE);
     }
-  settings->RdpSecurity = TRUE;
-  settings->NlaSecurity = FALSE;
+  /* Weston enables only TLS: it never turns FreeRDP_RdpSecurity on. Standard
+   * RDP security puts a security header with flags on every PDU, which changes
+   * what the client expects during LICENSING -- leave it at the default. */
+  (void) freerdp_settings_set_bool (settings, FreeRDP_NlaSecurity, FALSE);
 
   if (!client->Initialize (client))
     {
@@ -1840,22 +2012,41 @@ rdp_peer_init (freerdp_peer *client, MetaRdpServer *self)
       goto error;
     }
 
-  settings->OsMajorType = OSMAJORTYPE_UNIX;
-  settings->OsMinorType = OSMINORTYPE_PSEUDO_XSERVER;
-  settings->ColorDepth = 32;
-  settings->RefreshRect = TRUE;
-  settings->RemoteFxCodec = FALSE;
-  settings->NSCodec = TRUE;
-  settings->FrameMarkerCommandEnabled = TRUE;
-  settings->SurfaceFrameMarkerEnabled = TRUE;
+  (void) freerdp_settings_set_uint32 (settings, FreeRDP_OsMajorType, OSMAJORTYPE_UNIX);
+  (void) freerdp_settings_set_uint32 (settings, FreeRDP_OsMinorType,
+                               OSMINORTYPE_PSEUDO_XSERVER);
+  (void) freerdp_settings_set_uint32 (settings, FreeRDP_ColorDepth, 32);
+  (void) freerdp_settings_set_bool (settings, FreeRDP_RefreshRect, TRUE);
+  (void) freerdp_settings_set_bool (settings, FreeRDP_RemoteFxCodec, FALSE);
+  (void) freerdp_settings_set_bool (settings, FreeRDP_NSCodec, TRUE);
+  (void) freerdp_settings_set_bool (settings, FreeRDP_FrameMarkerCommandEnabled, TRUE);
+  (void) freerdp_settings_set_bool (settings, FreeRDP_SurfaceFrameMarkerEnabled, TRUE);
   /* v1: plain fullscreen desktop, not RAIL. */
-  settings->RemoteApplicationMode = FALSE;
-  settings->SupportGraphicsPipeline = TRUE;
-  settings->SupportMonitorLayoutPdu = TRUE;
-  settings->HasExtendedMouseEvent = TRUE;
-  settings->HasHorizontalWheel = TRUE;
+  (void) freerdp_settings_set_bool (settings, FreeRDP_RemoteApplicationMode, FALSE);
+  (void) freerdp_settings_set_bool (settings, FreeRDP_SupportGraphicsPipeline, TRUE);
+  (void) freerdp_settings_set_bool (settings, FreeRDP_SupportMonitorLayoutPdu, TRUE);
+  (void) freerdp_settings_set_bool (settings, FreeRDP_HasExtendedMouseEvent, TRUE);
+  (void) freerdp_settings_set_bool (settings, FreeRDP_HasHorizontalWheel, TRUE);
   /* Enable CLIPRDR so the client negotiates the clipboard channel. */
-  settings->RedirectClipboard = TRUE;
+  (void) freerdp_settings_set_bool (settings, FreeRDP_RedirectClipboard, TRUE);
+  /* Implicit in FreeRDP 2, must be requested explicitly in 3. */
+  (void) freerdp_settings_set_bool (settings, FreeRDP_FastPathInput, TRUE);
+
+  /* FreeRDP 3 added two connect-time steps to the server state machine that
+   * 2.x did not have, and both default to on:
+   *
+   *   - NetworkAutoDetect inserts CONNECT_TIME_AUTO_DETECT_REQUEST/RESPONSE
+   *     before LICENSING. We register no autodetect callbacks, so the server
+   *     would sit waiting for a response it never services.
+   *   - SupportMultitransport (with the UDPFECR flag) emits a SEC_TRANSPORT_REQ
+   *     after LICENSING to bootstrap a UDP side channel. WSLg runs over a
+   *     TCP-only vsock, so there is no UDP path to bootstrap.
+   *
+   * Turning both off collapses the 3.x state machine back to the 2.x topology.
+   */
+  (void) freerdp_settings_set_bool (settings, FreeRDP_NetworkAutoDetect, FALSE);
+  (void) freerdp_settings_set_bool (settings, FreeRDP_SupportMultitransport, FALSE);
+  (void) freerdp_settings_set_uint32 (settings, FreeRDP_MultitransportFlags, 0);
 
   client->Capabilities = xf_peer_capabilities;
   client->PostConnect = xf_peer_post_connect;
@@ -1878,7 +2069,8 @@ rdp_peer_init (freerdp_peer *client, MetaRdpServer *self)
     }
 
   {
-    PWtsApiFunctionTable fn = FreeRDP_InitWtsApi ();
+    /* FreeRDP 3 hands back a const table. */
+    const WtsApiFunctionTable *fn = FreeRDP_InitWtsApi ();
 
     WTSRegisterWtsApiFunctionTable (fn);
     peer_ctx->vcm = WTSOpenServerA ((LPSTR) peer_ctx);
@@ -1894,16 +2086,32 @@ rdp_peer_init (freerdp_peer *client, MetaRdpServer *self)
       }
   }
 
-  for (i = 0; i < handle_count && i < META_RDP_MAX_FREERDP_FDS; i++)
-    {
-      int fd = GetEventFileDescriptor (handles[i]);
+  {
+    HANDLE vcm_handle = peer_ctx->vcm ?
+      WTSVirtualChannelManagerGetEventHandle (peer_ctx->vcm) : NULL;
 
-      if (fd < 0)
-        continue;
+    /* handles[] is sized META_RDP_MAX_FREERDP_FDS + 1 so that the VCM handle
+     * always fits; clamp against fd_sources[], not the GetEventHandles limit,
+     * or a full peer handle table silently drops the VCM watch. */
+    for (i = 0; i < handle_count &&
+                peer_ctx->n_fd_sources < META_RDP_MAX_PEER_FD_SOURCES; i++)
+      {
+        int fd = GetEventFileDescriptor (handles[i]);
+        g_autofree char *label = NULL;
 
-      peer_ctx->fd_sources[peer_ctx->n_fd_sources++] =
-        meta_rdp_add_fd_source (fd, rdp_client_activity, client);
-    }
+        if (fd < 0)
+          continue;
+
+        if (vcm_handle && handles[i] == vcm_handle)
+          label = g_strdup ("vcm");
+        else
+          label = g_strdup_printf ("peer[%d]", i);
+
+        peer_ctx->fd_sources[peer_ctx->n_fd_sources++] =
+          meta_rdp_add_fd_source (fd, rdp_client_activity, client,
+                                  g_steal_pointer (&label));
+      }
+  }
 
   self->peers = g_list_prepend (self->peers, peer_ctx);
 
@@ -1912,6 +2120,15 @@ rdp_peer_init (freerdp_peer *client, MetaRdpServer *self)
   return 0;
 
 error:
+  /* Weston's rdp_peer_init closes the peer on the error path before unwinding;
+   * without this the socket is left open until the listener drops the peer. */
+  meta_rdp_peer_remove_fd_sources (peer_ctx);
+  if (peer_ctx->vcm)
+    {
+      WTSCloseServer (peer_ctx->vcm);
+      peer_ctx->vcm = NULL;
+    }
+  client->Close (client);
   freerdp_peer_context_free (client);
   return -1;
 }
@@ -1970,15 +2187,12 @@ rdp_implant_listener (MetaRdpServer    *self,
         continue;
 
       self->listener_fd_sources[self->n_listener_fd_sources++] =
-        meta_rdp_add_fd_source (fd, rdp_listener_activity, instance);
+        meta_rdp_add_fd_source (fd, rdp_listener_activity, instance,
+                                "listener");
     }
 
   return TRUE;
 }
-
-/* ------------------------------------------------------------------ */
-/* Task 03: TLS cert generation (winpr-makecert)                      */
-/* ------------------------------------------------------------------ */
 
 static gboolean
 meta_rdp_generate_session_tls (MetaRdpServer  *self,
@@ -2043,10 +2257,6 @@ meta_rdp_generate_session_tls (MetaRdpServer  *self,
   g_message ("rdp: generated session TLS cert at %s", self->cert_file);
   return TRUE;
 }
-
-/* ------------------------------------------------------------------ */
-/* Task 03: listener setup (vsock / tcp)                              */
-/* ------------------------------------------------------------------ */
 
 static int
 meta_rdp_create_vsock_fd (int port)
@@ -2252,12 +2462,8 @@ meta_rdp_server_new (MetaBackend  *backend,
 
   g_message ("rdp: starting MetaRdpServer (FreeRDP %s, gfxredir: %s)",
              FREERDP_VERSION_FULL,
-#ifdef HAVE_FREERDP_GFXREDIR_H
              "yes"
-#else
-             "no"
-#endif
-             );
+            );
 
   self = g_object_new (META_TYPE_RDP_SERVER, NULL);
   self->backend = backend;
