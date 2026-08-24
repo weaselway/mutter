@@ -35,6 +35,7 @@
 #include "core/boxes-private.h"
 #include "core/display-private.h"
 #include "core/window-private.h"
+#include "meta/meta-debug.h"
 #include "wayland/meta-wayland-actor-surface.h"
 #include "wayland/meta-wayland-buffer.h"
 #include "wayland/meta-wayland-client-private.h"
@@ -299,6 +300,91 @@ region_transform (const MtkRegion     *region,
   return transformed_region;
 }
 
+static const char *
+buffer_type_to_string (MetaWaylandBufferType type)
+{
+  switch (type)
+    {
+    case META_WAYLAND_BUFFER_TYPE_SHM:
+      return "shm";
+    case META_WAYLAND_BUFFER_TYPE_EGL_IMAGE:
+      return "egl-image";
+#ifdef HAVE_WAYLAND_EGLSTREAM
+    case META_WAYLAND_BUFFER_TYPE_EGL_STREAM:
+      return "egl-stream";
+#endif
+    case META_WAYLAND_BUFFER_TYPE_DMA_BUF:
+      return "dma-buf";
+    case META_WAYLAND_BUFFER_TYPE_SINGLE_PIXEL:
+      return "single-pixel";
+    case META_WAYLAND_BUFFER_TYPE_UNKNOWN:
+    default:
+      return "unknown";
+    }
+}
+
+/* Report who is committing what, and how much of it.
+ *
+ * An shm buffer costs a CPU copy of every damaged pixel into a texture
+ * (process_shm_buffer_damage), and a damage rectangle covering the whole
+ * surface additionally makes Cogl re-specify the texture with glTexImage2D
+ * rather than update it in place. Neither is visible from a profile alone,
+ * which shows the copy but not which client asked for it -- so name the
+ * window, the buffer type, and how much of the surface the damage covers.
+ *
+ * MUTTER_DEBUG=wayland to enable; compiled out entirely in release builds. */
+static void
+meta_wayland_log_buffer_damage (MetaWaylandSurface *surface,
+                                MetaWaylandBuffer  *buffer,
+                                MtkRegion          *buffer_region,
+                                const MtkRectangle *buffer_rect)
+{
+  MetaWindow *window;
+  const char *title = NULL;
+  const char *wm_class = NULL;
+  int n_rectangles;
+  int64_t damage_area = 0;
+  int64_t full_area;
+  gboolean covers_full_level = FALSE;
+
+  n_rectangles = mtk_region_num_rectangles (buffer_region);
+  if (n_rectangles == 0)
+    return;
+
+  for (int i = 0; i < n_rectangles; i++)
+    {
+      MtkRectangle rect = mtk_region_get_rectangle (buffer_region, i);
+
+      damage_area += (int64_t) rect.width * rect.height;
+
+      /* The condition Cogl uses to pick glTexImage2D over glTexSubImage2D:
+       * a single rectangle spanning the whole level re-specifies the texture,
+       * which on some drivers reallocates its storage every frame. */
+      if (rect.width == buffer_rect->width && rect.height == buffer_rect->height)
+        covers_full_level = TRUE;
+    }
+
+  full_area = (int64_t) buffer_rect->width * buffer_rect->height;
+
+  window = meta_wayland_surface_get_window (surface);
+  if (window)
+    {
+      title = meta_window_get_title (window);
+      wm_class = meta_window_get_wm_class (window);
+    }
+
+  meta_topic (META_DEBUG_WAYLAND,
+              "damage: %s buffer %dx%d, %d rect(s), %" G_GINT64_FORMAT "/%"
+              G_GINT64_FORMAT " px (%d%%)%s -- window '%s' [%s]",
+              buffer_type_to_string (buffer->type),
+              buffer_rect->width, buffer_rect->height,
+              n_rectangles, damage_area, full_area,
+              full_area > 0 ? (int) ((damage_area * 100) / full_area) : 0,
+              covers_full_level ? ", full-surface rect" : "",
+              title ? title : "(none)",
+              wm_class ? wm_class : "(no class)");
+}
+
 static void
 surface_process_damage (MetaWaylandSurface *surface,
                         MtkRegion          *surface_region,
@@ -386,6 +472,8 @@ surface_process_damage (MetaWaylandSurface *surface,
     }
 
   mtk_region_intersect_rectangle (buffer_region, &buffer_rect);
+
+  meta_wayland_log_buffer_damage (surface, buffer, buffer_region, &buffer_rect);
 
   meta_wayland_buffer_process_damage (buffer, surface->applied_state.texture,
                                       buffer_region);
