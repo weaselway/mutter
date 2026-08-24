@@ -520,6 +520,249 @@ meta_rdp_account_readback (int64_t elapsed_us,
   window_reads = 0;
 }
 
+/* One-shot diagnostic, run when META_RDP_PROBE_FORMATS is set in the
+ * environment: which pixel format can this framebuffer be read back into
+ * without the driver inserting a staging blit?
+ *
+ * Background, because the answer is not where it looks like it should be.
+ * Cogl has its own conversion path (cogl-framebuffer-gl.c:477: read into a
+ * malloc'd temp, convert on the CPU), but on the GL3 driver it is unreachable
+ * for our purposes: cogl_driver_gl3_get_read_pixels_format() ignores the
+ * framebuffer's internal format and returns the format the *caller* asked for
+ * (gl3/cogl-driver-gl3.c:445-456), so format_mismatch is always false. Cogl
+ * hands whatever we ask for straight to glReadPixels.
+ *
+ * The expensive mismatch is one layer down, in Mesa:
+ * _mesa_format_matches_format_and_type() (formats.c:1119, called from
+ * readpix.c:230 and st_cb_readpixels.c:522) is a strict equality between the
+ * renderbuffer's mesa_format and _mesa_format_from_format_and_type() of the
+ * GL format+type pair cogl emitted. Miss it and st_ReadPixels runs a full
+ * pipe->blit() into a freshly allocated staging texture before the transfer
+ * even begins.
+ *
+ * We cannot query the renderbuffer's mesa_format from here -- this cogl has no
+ * epoxy and mutter links no GL directly -- but we do not need to. Timing the
+ * candidates identifies the match: the one that skips the blit is
+ * substantially faster, and that is the property we actually care about.
+ *
+ * Only four candidates, not eight. cogl_driver_gl3_pixel_format_to_gl()
+ * (gl3/cogl-driver-gl3.c:139-198) emits the same GL format+type pair for a
+ * format and its X-variant -- BGRX_8888 and BGRA_8888 both give
+ * GL_BGRA + GL_UNSIGNED_BYTE -- so they are indistinguishable to glReadPixels
+ * and only these four GL pairs exist for 32bpp. (Corollary worth knowing: if
+ * the renderbuffer turns out to be an X format such as B8G8R8X8_UNORM, *no*
+ * cogl format can match it, since _mesa_format_from_format_and_type() never
+ * yields an X format. The blit would then be unavoidable through this API.)
+ *
+ * Costs a few full-frame readbacks, so it is opt-in and runs once. */
+static void
+meta_rdp_probe_readback_formats (CoglFramebuffer *framebuffer)
+{
+  static const struct
+  {
+    CoglPixelFormat format;
+    const char *name;
+    const char *gl_pair;
+    const char *bytes;
+  } candidates[] = {
+    { COGL_PIXEL_FORMAT_BGRA_8888_PRE, "BGRA_8888_PRE",
+      "GL_BGRA + GL_UNSIGNED_BYTE       ", "B,G,R,A" },
+    { COGL_PIXEL_FORMAT_RGBA_8888_PRE, "RGBA_8888_PRE",
+      "GL_RGBA + GL_UNSIGNED_BYTE       ", "R,G,B,A" },
+    { COGL_PIXEL_FORMAT_ARGB_8888_PRE, "ARGB_8888_PRE",
+      "GL_BGRA + GL_UNSIGNED_INT_8_8_8_8", "A,R,G,B" },
+    { COGL_PIXEL_FORMAT_ABGR_8888_PRE, "ABGR_8888_PRE",
+      "GL_RGBA + GL_UNSIGNED_INT_8_8_8_8", "A,B,G,R" },
+  };
+  /* Enough to see past one-off scheduling noise; we report the minimum, which
+   * is the honest figure for "what does this cost when nothing interferes". */
+  const int n_runs = 5;
+  static gboolean probed = FALSE;
+  CoglContext *cogl_context = cogl_framebuffer_get_context (framebuffer);
+  int width = cogl_framebuffer_get_width (framebuffer);
+  int height = cogl_framebuffer_get_height (framebuffer);
+  g_autofree uint8_t *scratch = NULL;
+  int64_t best_us = G_MAXINT64;
+  const char *best_name = NULL;
+  size_t i;
+
+  if (probed || !g_getenv ("META_RDP_PROBE_FORMATS"))
+    return;
+
+  probed = TRUE;
+
+  if (width <= 0 || height <= 0)
+    return;
+
+  scratch = g_malloc ((size_t) width * height * 4);
+
+  g_message ("rdp: probing readback formats at %dx%d (%d runs each); the "
+             "fastest is the one Mesa can memcpy without blit_to_staging",
+             width, height, n_runs);
+
+  for (i = 0; i < G_N_ELEMENTS (candidates); i++)
+    {
+      int64_t min_us = G_MAXINT64;
+      int64_t total_us = 0;
+      gboolean ok = TRUE;
+      int run;
+
+      for (run = 0; run < n_runs && ok; run++)
+        {
+          CoglBitmap *bitmap;
+          int64_t started_us;
+
+          bitmap = cogl_bitmap_new_for_data (cogl_context,
+                                             width, height,
+                                             candidates[i].format,
+                                             width * 4,
+                                             scratch);
+
+          started_us = g_get_monotonic_time ();
+          ok = cogl_framebuffer_read_pixels_into_bitmap (framebuffer, 0, 0,
+                                                         COGL_READ_PIXELS_COLOR_BUFFER,
+                                                         bitmap);
+          if (ok)
+            {
+              int64_t elapsed_us = g_get_monotonic_time () - started_us;
+
+              total_us += elapsed_us;
+              if (elapsed_us < min_us)
+                min_us = elapsed_us;
+            }
+
+          g_object_unref (bitmap);
+        }
+
+      if (!ok)
+        {
+          g_message ("rdp:   %-14s %s  bytes %-7s  FAILED",
+                     candidates[i].name, candidates[i].gl_pair,
+                     candidates[i].bytes);
+          continue;
+        }
+
+      g_message ("rdp:   %-14s %s  bytes %-7s  min %6" G_GINT64_FORMAT " us, "
+                 "mean %6" G_GINT64_FORMAT " us",
+                 candidates[i].name, candidates[i].gl_pair,
+                 candidates[i].bytes, min_us, total_us / n_runs);
+
+      if (min_us < best_us)
+        {
+          best_us = min_us;
+          best_name = candidates[i].name;
+        }
+    }
+
+  if (best_name)
+    {
+      /* Interpreting this: only one candidate can equal the renderbuffer's
+       * mesa_format, so a genuine match shows up as *one* clearly faster row.
+       * Rows within noise of each other mean no candidate matches (or the blit
+       * is cheap next to the fence stall) -- which is what this reported when
+       * it was first run, and why the gfxredir format change was dropped. See
+       * READBACK-PLAN.md step 1c. */
+      g_message ("rdp: fastest readback format is %s (%" G_GINT64_FORMAT " us); "
+                 "currently reading as BGRA_8888_PRE. A lone clear winner means "
+                 "blit_to_staging is firing for the others and the gfxredir "
+                 "buffer format should follow it; a tie means the format is not "
+                 "where the time goes.", best_name, best_us);
+    }
+}
+
+/* One-shot self-test for the readback PBO, run when META_RDP_PROBE_PBO is set.
+ *
+ * The point is to find out which memory the driver puts a readback PBO in
+ * *before* the async readback is built on top of it. On d3d12 a buffer created
+ * with a DRAW usage hint lands on a D3D12_HEAP_TYPE_DEFAULT heap, which
+ * can_map_directly() rejects, so mapping it for reading allocates a staging
+ * buffer, copies through it and blocks on a fence -- the exact stall the PBO is
+ * meant to remove. That failure is invisible from here: the pixels still come
+ * back correct, just slowly.
+ *
+ * Normal compositor traffic cannot answer this. The only buffers cogl creates
+ * by itself are journal vertex buffers (GL_ARRAY_BUFFER, and only when the
+ * journal's VBO pool has to grow), so watching glBufferData tells us nothing
+ * about the pixel-pack path. This creates one deliberately.
+ *
+ * Creating the buffer is not enough on its own -- cogl defers glBufferData to
+ * the first bind/map (recreate_store()), and the d3d12 resource is only
+ * allocated at that point. So map it too, which is also the operation whose
+ * cost we care about.
+ *
+ * Run with COGL_DEBUG_BUFFER_USAGE=1 to see cogl's usage enum (expect 0x88E1,
+ * GL_STREAM_READ) and D3D12_DEBUG_BUFFER_USAGE=1 to see where it landed (expect
+ * usage=STAGING heap=READBACK mappable=yes). */
+static void
+meta_rdp_probe_readback_pbo (CoglFramebuffer *framebuffer)
+{
+  static gboolean probed = FALSE;
+  CoglContext *cogl_context = cogl_framebuffer_get_context (framebuffer);
+  int width = cogl_framebuffer_get_width (framebuffer);
+  int height = cogl_framebuffer_get_height (framebuffer);
+  size_t size = (size_t) width * height * 4;
+  CoglPixelBuffer *pbo;
+  int64_t started_us;
+  void *data;
+
+  if (probed || !g_getenv ("META_RDP_PROBE_PBO"))
+    return;
+
+  probed = TRUE;
+
+  if (width <= 0 || height <= 0)
+    return;
+
+  g_message ("rdp: probing a %zu-byte readback PBO", size);
+
+  pbo = cogl_pixel_buffer_new_for_readback (cogl_context, size);
+  if (!pbo)
+    {
+      g_warning ("rdp: could not create a readback PBO");
+      return;
+    }
+
+  /* Map repeatedly, and report the first separately from the rest.
+   *
+   * The two are different costs and only the second one matters. cogl defers
+   * glBufferData to the first bind/map (recreate_store()), so the first map
+   * also pays for allocating the resource -- on a cold pb_cache that is a real
+   * CreateCommittedResource for the whole frame. Steady state is what step 4
+   * pays per frame, once the ring has been allocated and is being reused.
+   *
+   * If the two are close, the buffer is not really being reused and step 4's
+   * ring is not doing its job. If the first is large and the rest are small,
+   * that is the expected shape and it confirms the ring must be persistent. */
+  const int n_maps = 5;
+  int64_t first_us = 0;
+  int64_t rest_us = 0;
+
+  for (int i = 0; i < n_maps; i++)
+    {
+      started_us = g_get_monotonic_time ();
+      data = cogl_buffer_map (COGL_BUFFER (pbo), COGL_BUFFER_ACCESS_READ, 0);
+      if (!data)
+        {
+          g_warning ("rdp: readback PBO could not be mapped for reading");
+          g_object_unref (pbo);
+          return;
+        }
+
+      if (i == 0)
+        first_us = g_get_monotonic_time () - started_us;
+      else
+        rest_us += g_get_monotonic_time () - started_us;
+
+      cogl_buffer_unmap (COGL_BUFFER (pbo));
+    }
+
+  g_message ("rdp: readback PBO first map %" G_GINT64_FORMAT " us "
+             "(includes allocation), subsequent %" G_GINT64_FORMAT " us mean",
+             first_us, rest_us / (n_maps - 1));
+
+  g_object_unref (pbo);
+}
+
 /* Read the @width x @height region at (@x, @y) of @framebuffer into @dest
  * (ARGB8888, i.e. BGRA byte order in memory, which is what NSCodec's
  * PIXEL_FORMAT_BGRA32, gfxredir's ARGB_8888 and an uncompressed SURFACE_BITS
@@ -547,6 +790,9 @@ meta_rdp_read_framebuffer (CoglFramebuffer *framebuffer,
   CoglBitmap *bitmap;
   int64_t started_us;
   gboolean ok;
+
+  meta_rdp_probe_readback_formats (framebuffer);
+  meta_rdp_probe_readback_pbo (framebuffer);
 
   bitmap = cogl_bitmap_new_for_data (cogl_context,
                                      width, height,

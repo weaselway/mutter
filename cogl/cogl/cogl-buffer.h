@@ -107,6 +107,44 @@ typedef enum /*< prefix=COGL_BUFFER_UPDATE_HINT >*/
 } CoglBufferUpdateHint;
 
 /**
+ * CoglBufferUsageHint:
+ * @COGL_BUFFER_USAGE_HINT_DRAW: the buffer will be written by the application
+ *   and read by the GPU
+ * @COGL_BUFFER_USAGE_HINT_READ: the buffer will be written by the GPU and read
+ *   back by the application
+ *
+ * The direction data flows through a buffer, orthogonal to the frequency
+ * described by #CoglBufferUpdateHint. Together the two select the GL usage
+ * enum: DRAW+STREAM gives `GL_STREAM_DRAW`, READ+STREAM gives `GL_STREAM_READ`,
+ * and so on.
+ *
+ * This matters more than it looks. A driver is free to place a DRAW buffer in
+ * memory the CPU cannot read cheaply -- on d3d12 a DRAW buffer lands on a
+ * `D3D12_HEAP_TYPE_DEFAULT` heap, and mapping it for reading copies through yet
+ * another staging buffer and blocks on a fence. Only a READ buffer reaches a
+ * readback heap that can be mapped directly. A PBO used for
+ * [method@Cogl.Framebuffer.read_pixels_into_bitmap] therefore wants
+ * %COGL_BUFFER_USAGE_HINT_READ; getting this wrong turns an asynchronous
+ * readback back into a synchronous one, silently.
+ */
+typedef enum /*< prefix=COGL_BUFFER_USAGE_HINT >*/
+{
+  COGL_BUFFER_USAGE_HINT_DRAW,
+  COGL_BUFFER_USAGE_HINT_READ
+} CoglBufferUsageHint;
+
+/**
+ * cogl_buffer_get_usage_hint:
+ * @buffer: a buffer object
+ *
+ * Retrieves the usage hint the buffer was created with.
+ *
+ * Return value: the #CoglBufferUsageHint of the buffer
+ */
+COGL_EXPORT CoglBufferUsageHint
+cogl_buffer_get_usage_hint (CoglBuffer *buffer);
+
+/**
  * cogl_buffer_set_update_hint:
  * @buffer: a buffer object
  * @hint: the new hint
