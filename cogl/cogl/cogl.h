@@ -66,6 +66,7 @@
 #include "cogl/cogl-display.h"
 #include "cogl/cogl-context.h"
 #include "cogl/cogl-buffer.h"
+#include "cogl/cogl-gpu-fence.h"
 #include "cogl/cogl-pixel-buffer.h"
 #include "cogl/cogl-texture-2d.h"
 #include "cogl/cogl-texture-2d-sliced.h"
