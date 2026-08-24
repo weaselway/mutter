@@ -24,12 +24,15 @@
 #include "backends/meta-backend-private.h"
 #include "backends/meta-crtc-mode.h"
 #include "backends/meta-cursor-tracker-private.h"
+#include "backends/meta-logical-monitor-private.h"
 #include "backends/meta-monitor-manager-private.h"
+#include "backends/meta-monitor-private.h"
 #include "backends/meta-renderer.h"
 #include "backends/meta-renderer-view.h"
 #include "backends/meta-stage-private.h"
 #include "backends/meta-virtual-monitor.h"
 #include "clutter/clutter.h"
+#include "clutter/clutter-cursor-private.h"
 #include "cogl/cogl.h"
 #include "meta/meta-backend.h"
 #include "meta/meta-keymap-description.h"
@@ -40,6 +43,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -173,6 +177,7 @@ typedef struct _MetaRdpPeerContext
   guint disp_idle_id;
   int disp_requested_width;
   int disp_requested_height;
+  uint32_t disp_requested_scale_percent;
 
   /* Set between pushing a DesktopResize and the client's re-activation. The
    * client's surface is the old size until it comes back, so nothing may be
@@ -286,13 +291,80 @@ G_DEFINE_FINAL_TYPE (MetaRdpServer, meta_rdp_server, G_TYPE_OBJECT)
 /* mismatch there and pushes a DesktopResize back to the client.        */
 /* ------------------------------------------------------------------ */
 
+/* The scale the desktop is currently running at, i.e. how many framebuffer
+ * pixels there are per stage (logical) pixel.
+ *
+ * The RDP client works in framebuffer pixels throughout -- its desktop size,
+ * its pointer events and its cursor sprite are all physical -- while Clutter
+ * works in logical ones, so this is the conversion factor between the two. */
+static float
+meta_rdp_server_get_scale (MetaRdpServer *self)
+{
+  MetaMonitorManager *monitor_manager =
+    meta_backend_get_monitor_manager (self->backend);
+  MetaLogicalMonitor *logical_monitor;
+
+  /* Single-head: the primary logical monitor is the desktop. */
+  logical_monitor =
+    meta_monitor_manager_get_primary_logical_monitor (monitor_manager);
+  if (!logical_monitor)
+    return 1.0f;
+
+  return meta_logical_monitor_get_scale (logical_monitor);
+}
+
+/* Turn an MS-RDPEDISP DesktopScaleFactor (a percentage: 100, 150, 200...) into
+ * a scale mutter will accept for a @width x @height mode.
+ *
+ * Mutter only allows scales that divide the resolution into whole logical
+ * pixels, so an arbitrary percentage has to be snapped to the nearest one it
+ * supports; meta_get_closest_monitor_scale_factor_for_resolution() enumerates
+ * exactly the set the monitor config manager would.
+ *
+ * Weston does the equivalent in disp_get_client_scale_from_monitor()
+ * (rdpdisp.c), but has to choose up front between integer and fractional
+ * scaling -- mutter's LOGICAL layout mode supports fractional natively, so we
+ * can just take what the client asked for. */
+static float
+meta_rdp_scale_from_percent (uint32_t desktop_scale_factor,
+                             int      width,
+                             int      height)
+{
+  float requested;
+  float scale;
+
+  /* 0 means the client didn't report one. */
+  if (desktop_scale_factor == 0)
+    return 1.0f;
+
+  requested = desktop_scale_factor / 100.0f;
+  if (requested < 1.0f)
+    requested = 1.0f;
+
+  scale = meta_get_closest_monitor_scale_factor_for_resolution ((unsigned int) width,
+                                                                (unsigned int) height,
+                                                                requested);
+  /* No valid scale for this resolution at all (the logical size would be too
+   * small to be usable); stay unscaled rather than refuse the mode. */
+  if (scale <= 0.0f)
+    return 1.0f;
+
+  if (!G_APPROX_VALUE (scale, requested, 0.001f))
+    {
+      g_message ("rdp: client asked for %u%% scaling at %dx%d, using %.3f "
+                 "(nearest mutter supports)",
+                 desktop_scale_factor, width, height, scale);
+    }
+
+  return scale;
+}
+
 /* Mutter's own resize-a-virtual-monitor path is ensure_virtual_monitor() in
  * backends/meta-screen-cast-virtual-stream-src.c; this is the same sequence.
  * Must run on the main thread -- it reconfigures Clutter.
  *
- * @scale is plumbed through but always 1.0 today; honouring the client's
- * DesktopScaleFactor also needs the input mapping and the cursor sprite to
- * stop being 1:1, which is a separate change.
+ * @width and @height are in framebuffer pixels (what the client sends); the
+ * logical desktop ends up @width/@scale x @height/@scale.
  *
  * Returns TRUE if a new mode was actually applied. */
 static gboolean
@@ -331,11 +403,17 @@ meta_rdp_server_resize_monitor (MetaRdpServer *self,
 
   crtc_mode = meta_virtual_monitor_get_crtc_mode (virtual_monitor);
   mode_info = meta_crtc_mode_get_info (crtc_mode);
-  if (mode_info->width == width && mode_info->height == height)
+  if (mode_info->width == width && mode_info->height == height &&
+      mode_info->has_preferred_scale &&
+      G_APPROX_VALUE (mode_info->preferred_scale, scale, 0.001f))
     return FALSE;
 
-  g_message ("rdp: resizing virtual monitor %dx%d -> %dx%d",
-             mode_info->width, mode_info->height, width, height);
+  g_message ("rdp: reconfiguring virtual monitor %dx%d@%.3f -> %dx%d@%.3f "
+             "(logical %dx%d)",
+             mode_info->width, mode_info->height,
+             mode_info->has_preferred_scale ? mode_info->preferred_scale : 1.0f,
+             width, height, scale,
+             (int) floorf (width / scale), (int) floorf (height / scale));
 
   new_mode_info = meta_virtual_mode_info_new (width, height,
                                               mode_info->refresh_rate);
@@ -1291,27 +1369,100 @@ meta_rdp_peer_hide_pointer (MetaRdpPeerContext *peer_ctx)
   update->EndPaint (update->context);
 }
 
+/* Resample @src (@src_w x @src_h, BGRA premultiplied) to @dst_w x @dst_h and
+ * write it into @dst bottom-up, the row order a Windows DIB wants.
+ *
+ * Bilinear, on premultiplied data so the filtering stays correct across the
+ * transparent edges a cursor is mostly made of. Cursors are at most
+ * META_RDP_MAX_POINTER_SIZE square and this only runs when the shape changes,
+ * so a straightforward implementation is fine. */
+static void
+meta_rdp_scale_bgra_flip (const uint8_t *src,
+                          int            src_w,
+                          int            src_h,
+                          uint8_t       *dst,
+                          int            dst_w,
+                          int            dst_h)
+{
+  int src_stride = src_w * 4;
+  int dst_stride = dst_w * 4;
+  /* Map destination pixel centres back into the source. */
+  float x_ratio = (float) src_w / dst_w;
+  float y_ratio = (float) src_h / dst_h;
+
+  for (int dy = 0; dy < dst_h; dy++)
+    {
+      /* Flip: the last destination row holds the first source row. */
+      uint8_t *dst_row = dst + (size_t) (dst_h - 1 - dy) * dst_stride;
+      float sy = (dy + 0.5f) * y_ratio - 0.5f;
+      int y0 = (int) floorf (sy);
+      float fy = sy - y0;
+      int y1;
+
+      y0 = CLAMP (y0, 0, src_h - 1);
+      y1 = CLAMP (y0 + 1, 0, src_h - 1);
+
+      for (int dx = 0; dx < dst_w; dx++)
+        {
+          float sx = (dx + 0.5f) * x_ratio - 0.5f;
+          int x0 = (int) floorf (sx);
+          float fx = sx - x0;
+          int x1;
+          const uint8_t *p00, *p01, *p10, *p11;
+
+          x0 = CLAMP (x0, 0, src_w - 1);
+          x1 = CLAMP (x0 + 1, 0, src_w - 1);
+
+          p00 = src + (size_t) y0 * src_stride + (size_t) x0 * 4;
+          p01 = src + (size_t) y0 * src_stride + (size_t) x1 * 4;
+          p10 = src + (size_t) y1 * src_stride + (size_t) x0 * 4;
+          p11 = src + (size_t) y1 * src_stride + (size_t) x1 * 4;
+
+          for (int c = 0; c < 4; c++)
+            {
+              float top = p00[c] + (p01[c] - p00[c]) * fx;
+              float bottom = p10[c] + (p11[c] - p10[c]) * fx;
+              float value = top + (bottom - top) * fy;
+
+              dst_row[dx * 4 + c] = (uint8_t) CLAMP (value + 0.5f, 0.0f, 255.0f);
+            }
+        }
+    }
+}
+
+/* @dst_width / @dst_height are the size the sprite should occupy in the
+ * client's (framebuffer) pixels, which is not the texture's size on a scaled
+ * desktop -- see meta_rdp_peer_update_pointer(). */
 static void
 meta_rdp_peer_send_pointer (MetaRdpPeerContext *peer_ctx,
                             CoglTexture        *texture,
                             int                 hot_x,
-                            int                 hot_y)
+                            int                 hot_y,
+                            int                 dst_width,
+                            int                 dst_height)
 {
   rdpUpdate *update = peer_ctx->peer->context->update;
   POINTER_LARGE_UPDATE pointer_update = { 0 };
   int width = cogl_texture_get_width (texture);
   int height = cogl_texture_get_height (texture);
   int stride = width * 4;
+  int dst_stride;
   g_autofree uint8_t *bits = NULL;
   g_autofree uint8_t *flipped = NULL;
-  int y;
 
-  if (width <= 0 || height <= 0 ||
-      width > META_RDP_MAX_POINTER_SIZE ||
-      height > META_RDP_MAX_POINTER_SIZE)
+  if (width <= 0 || height <= 0 || dst_width <= 0 || dst_height <= 0)
+    {
+      g_warning ("rdp: cursor is %dx%d -> %dx%d; hiding",
+                 width, height, dst_width, dst_height);
+      meta_rdp_peer_hide_pointer (peer_ctx);
+      return;
+    }
+
+  if (dst_width > META_RDP_MAX_POINTER_SIZE ||
+      dst_height > META_RDP_MAX_POINTER_SIZE)
     {
       g_warning ("rdp: cursor is %dx%d, beyond the large pointer limit; hiding",
-                 width, height);
+                 dst_width, dst_height);
       meta_rdp_peer_hide_pointer (peer_ctx);
       return;
     }
@@ -1329,22 +1480,36 @@ meta_rdp_peer_send_pointer (MetaRdpPeerContext *peer_ctx,
     }
 
   /* Pointer bitmaps are bottom-up, like a Windows DIB. */
-  flipped = g_malloc ((size_t) stride * height);
-  for (y = 0; y < height; y++)
-    memcpy (flipped + (size_t) y * stride,
-            bits + (size_t) (height - 1 - y) * stride,
-            stride);
+  dst_stride = dst_width * 4;
+  flipped = g_malloc ((size_t) dst_stride * dst_height);
+
+  if (dst_width == width && dst_height == height)
+    {
+      for (int y = 0; y < height; y++)
+        memcpy (flipped + (size_t) y * stride,
+                bits + (size_t) (height - 1 - y) * stride,
+                stride);
+    }
+  else
+    {
+      meta_rdp_scale_bgra_flip (bits, width, height,
+                                flipped, dst_width, dst_height);
+
+      /* The hotspot is in texture pixels; move it with the image. */
+      hot_x = (int) roundf ((float) hot_x * dst_width / width);
+      hot_y = (int) roundf ((float) hot_y * dst_height / height);
+    }
 
   pointer_update.xorBpp = 32;
   pointer_update.cacheIndex = 0;
-  pointer_update.hotSpotX = CLAMP (hot_x, 0, width - 1);
-  pointer_update.hotSpotY = CLAMP (hot_y, 0, height - 1);
-  pointer_update.width = width;
-  pointer_update.height = height;
+  pointer_update.hotSpotX = CLAMP (hot_x, 0, dst_width - 1);
+  pointer_update.hotSpotY = CLAMP (hot_y, 0, dst_height - 1);
+  pointer_update.width = dst_width;
+  pointer_update.height = dst_height;
   /* A 32bpp xorMask carries its own alpha, so no separate AND mask. */
   pointer_update.lengthAndMask = 0;
   pointer_update.andMaskData = NULL;
-  pointer_update.lengthXorMask = (UINT32) stride * height;
+  pointer_update.lengthXorMask = (UINT32) dst_stride * dst_height;
   pointer_update.xorMaskData = flipped;
 
   update->BeginPaint (update->context);
@@ -1356,7 +1521,13 @@ static void
 meta_rdp_peer_update_pointer (MetaRdpPeerContext *peer_ctx)
 {
   MetaCursorTracker *cursor_tracker;
+  ClutterCursor *cursor;
   CoglTexture *texture;
+  float scale;
+  float logical_width;
+  float logical_height;
+  int dst_width;
+  int dst_height;
   int hot_x = 0;
   int hot_y = 0;
 
@@ -1371,15 +1542,54 @@ meta_rdp_peer_update_pointer (MetaRdpPeerContext *peer_ctx)
       return;
     }
 
-  texture = meta_cursor_tracker_get_sprite (cursor_tracker);
+  /* Go through the ClutterCursor rather than meta_cursor_tracker_get_sprite():
+   * the sprite's texture size alone doesn't say how big it should appear. */
+  cursor = META_CURSOR_TRACKER_GET_CLASS (cursor_tracker)->get_sprite (cursor_tracker);
+  if (!cursor)
+    {
+      meta_rdp_peer_hide_pointer (peer_ctx);
+      return;
+    }
+
+  clutter_cursor_realize_texture (cursor);
+  texture = clutter_cursor_get_texture (cursor, &hot_x, &hot_y);
   if (!texture)
     {
       meta_rdp_peer_hide_pointer (peer_ctx);
       return;
     }
 
-  meta_cursor_tracker_get_hot (cursor_tracker, &hot_x, &hot_y);
-  meta_rdp_peer_send_pointer (peer_ctx, texture, hot_x, hot_y);
+  /* Work out how large the sprite should be in the client's pixels.
+   *
+   * The texture is not authoritative: on a scaled desktop the xcursor backend
+   * loads the theme at ceil(scale) and records the size it should actually be
+   * drawn at as the viewport destination size, in logical pixels
+   * (meta_cursor_xcursor_prepare_at). Where that isn't set -- we disable the
+   * cursor overlays, so nothing may have prepared the sprite -- fall back to
+   * the texture's own scale, which is 1.0 for an unprepared xcursor and
+   * therefore means the texture is already logical-sized. */
+  if (!clutter_cursor_get_viewport_dst_size (cursor, &dst_width, &dst_height))
+    {
+      float texture_scale = clutter_cursor_get_texture_scale (cursor);
+
+      if (texture_scale <= 0.0f)
+        texture_scale = 1.0f;
+
+      logical_width = cogl_texture_get_width (texture) / texture_scale;
+      logical_height = cogl_texture_get_height (texture) / texture_scale;
+    }
+  else
+    {
+      logical_width = dst_width;
+      logical_height = dst_height;
+    }
+
+  scale = meta_rdp_server_get_scale (peer_ctx->server);
+  dst_width = (int) roundf (logical_width * scale);
+  dst_height = (int) roundf (logical_height * scale);
+
+  meta_rdp_peer_send_pointer (peer_ctx, texture, hot_x, hot_y,
+                              dst_width, dst_height);
 }
 
 static void
@@ -1403,6 +1613,44 @@ on_cursor_visibility_changed (MetaCursorTracker *cursor_tracker,
                               MetaRdpServer     *self)
 {
   meta_rdp_server_update_pointer (self);
+}
+
+/* Convert a region in stage (logical) coordinates into framebuffer pixels for
+ * @view. Rounds outward: under-reporting damage leaves stale pixels on the
+ * client, over-reporting only costs a slightly larger readback. */
+static MtkRegion *
+meta_rdp_region_to_framebuffer (const MtkRegion  *region,
+                                ClutterStageView *view)
+{
+  float scale = clutter_stage_view_get_scale (view);
+  MtkRectangle view_layout;
+  MtkRegion *scaled;
+  int n_rects;
+
+  clutter_stage_view_get_layout (view, &view_layout);
+
+  if (G_APPROX_VALUE (scale, 1.0f, 0.001f) &&
+      view_layout.x == 0 && view_layout.y == 0)
+    return mtk_region_copy (region);
+
+  scaled = mtk_region_create ();
+  n_rects = mtk_region_num_rectangles (region);
+
+  for (int i = 0; i < n_rects; i++)
+    {
+      MtkRectangle rect = mtk_region_get_rectangle (region, i);
+
+      /* Stage coordinates are global; make them view-relative first, since
+       * the framebuffer starts at the view's origin. */
+      rect.x -= view_layout.x;
+      rect.y -= view_layout.y;
+
+      mtk_rectangle_scale_double (&rect, scale, MTK_ROUNDING_STRATEGY_GROW,
+                                  &rect);
+      mtk_region_union_rectangle (scaled, &rect);
+    }
+
+  return scaled;
 }
 
 static void
@@ -1429,7 +1677,14 @@ on_frame_ready (MetaStage        *stage,
    * frames. */
   if (redraw_clip && !mtk_region_is_empty (redraw_clip))
     {
-      damage = mtk_region_copy (redraw_clip);
+      /* The redraw clip is in stage coordinates, which are logical, while
+       * everything downstream of here -- the readback, the shm buffers, the
+       * client -- works in framebuffer pixels. On an unscaled desktop the two
+       * are the same; on a scaled one, presenting the logical rectangle
+       * verbatim updates only the top-left 1/scale of what actually changed.
+       * paint_transformed_framebuffer() in clutter-stage-view.c performs the
+       * same conversion when it composites the view. */
+      damage = meta_rdp_region_to_framebuffer (redraw_clip, view);
     }
   else
     {
@@ -1454,6 +1709,21 @@ on_watched_view_destroyed (gpointer  user_data,
 {
   MetaRdpWatchedView *watched = user_data;
   MetaRdpServer *self = watched->server;
+
+  /* The watch has to go with the view. MetaStage keeps watches in a flat
+   * array and never purges them when a view is destroyed --
+   * meta_stage_remove_watch() is the only removal path -- and
+   * notify_watchers_for_mode() matches them by comparing watch->view against
+   * the view being painted, by pointer. Leaving one behind is not merely a
+   * leak: rebuilding the views (which is what a resize does) readily hands a
+   * new ClutterStageView the address of one just freed, at which point the
+   * stale watch starts matching and calls us back with this freed struct. */
+  if (watched->paint_watch)
+    {
+      meta_stage_remove_watch (meta_rdp_server_get_stage (self),
+                               watched->paint_watch);
+      watched->paint_watch = NULL;
+    }
 
   watched->view = NULL;
   watched->destroy_handler_id = 0;
@@ -1519,7 +1789,9 @@ meta_rdp_server_detach_views (MetaRdpServer *self)
     {
       MetaRdpWatchedView *watched = l->data;
 
-      if (watched->view && watched->paint_watch)
+      /* Unconditionally: the watch belongs to the stage, not the view, and
+       * has to be removed even if the view is already gone. */
+      if (watched->paint_watch)
         meta_stage_remove_watch (stage, watched->paint_watch);
       if (watched->view && watched->destroy_handler_id)
         g_object_weak_unref (G_OBJECT (watched->view),
@@ -1537,6 +1809,10 @@ on_monitors_changed (MetaMonitorManager *monitor_manager,
 {
   g_message ("rdp: monitors changed, re-scanning views");
   meta_rdp_server_attach_views (self);
+
+  /* The scale may have changed with the layout, and the sprite we last sent
+   * was sized for the old one. */
+  meta_rdp_server_update_pointer (self);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1867,17 +2143,21 @@ meta_rdp_disp_dispatch (gpointer user_data)
   MetaRdpPeerContext *peer_ctx = user_data;
   int width;
   int height;
+  uint32_t scale_percent;
 
   g_mutex_lock (&peer_ctx->disp_mutex);
   peer_ctx->disp_idle_id = 0;
   width = peer_ctx->disp_requested_width;
   height = peer_ctx->disp_requested_height;
+  scale_percent = peer_ctx->disp_requested_scale_percent;
   g_mutex_unlock (&peer_ctx->disp_mutex);
 
   /* No DesktopResize from here: the resize is asynchronous, and
    * meta_rdp_peer_present() pushes it once a frame actually arrives at the
    * new size. */
-  meta_rdp_server_resize_monitor (peer_ctx->server, width, height, 1.0f);
+  meta_rdp_server_resize_monitor (peer_ctx->server, width, height,
+                                  meta_rdp_scale_from_percent (scale_percent,
+                                                               width, height));
 
   return G_SOURCE_REMOVE;
 }
@@ -1920,6 +2200,9 @@ meta_rdp_disp_monitor_layout (DispServerContext                        *context,
   g_mutex_lock (&peer_ctx->disp_mutex);
   peer_ctx->disp_requested_width = (int) primary->Width;
   peer_ctx->disp_requested_height = (int) primary->Height;
+  /* DesktopScaleFactor is the DPI scaling the user picked; DeviceScaleFactor
+   * describes the panel itself and is not ours to apply. */
+  peer_ctx->disp_requested_scale_percent = primary->DesktopScaleFactor;
   if (peer_ctx->disp_idle_id == 0)
     {
       /* G_PRIORITY_DEFAULT for the same reason as the gfxredir dispatch. */
@@ -2272,18 +2555,26 @@ meta_rdp_ensure_virtual_keyboard (MetaRdpPeerContext *peer_ctx)
     }
 }
 
-/* Absolute pointer motion. On our single fullscreen output the RDP client
- * coordinates map 1:1 into stage coordinates (scale 1.0), so this collapses to
- * identity (Weston's to_weston_coordinate() does the same for one output). */
+/* Absolute pointer motion.
+ *
+ * RDP pointer coordinates are in desktop pixels -- the same space as
+ * FreeRDP_DesktopWidth/Height and our framebuffer -- while Clutter wants stage
+ * coordinates, which are logical. On a scaled desktop those differ by the
+ * monitor scale, so divide. Weston's to_weston_coordinate() does the same
+ * (rdpdisp.c), including the per-head origin offset we don't need while there
+ * is only one output at (0,0). */
 static void
 meta_rdp_notify_pointer_position (MetaRdpPeerContext *peer_ctx,
                                   UINT16              x,
                                   UINT16              y)
 {
+  float scale = meta_rdp_server_get_scale (peer_ctx->server);
+
   meta_rdp_ensure_virtual_pointer (peer_ctx);
   clutter_virtual_input_device_notify_absolute_motion (peer_ctx->virtual_pointer,
                                                        CLUTTER_CURRENT_TIME,
-                                                       (double) x, (double) y);
+                                                       (double) x / scale,
+                                                       (double) y / scale);
 }
 
 /* Debounce redundant button state, matching Weston's rdp_validate_button_state.
@@ -2578,8 +2869,9 @@ xf_peer_adjust_monitor_layout (freerdp_peer *client)
       if (!monitor)
         continue;
 
-      g_message ("rdp: client monitor[%u] %dx%d+%d+%d%s",
+      g_message ("rdp: client monitor[%u] %dx%d+%d+%d scale %u%%%s",
                  i, monitor->width, monitor->height, monitor->x, monitor->y,
+                 monitor->attributes.desktopScaleFactor,
                  monitor->is_primary ? " (primary)" : "");
 
       if (monitor->is_primary && !primary)
@@ -2596,7 +2888,10 @@ xf_peer_adjust_monitor_layout (freerdp_peer *client)
         g_message ("rdp: only the primary monitor is used (single-head)");
 
       meta_rdp_server_resize_monitor (peer_ctx->server,
-                                      primary->width, primary->height, 1.0f);
+                                      primary->width, primary->height,
+                                      meta_rdp_scale_from_percent (primary->attributes.desktopScaleFactor,
+                                                                   primary->width,
+                                                                   primary->height));
     }
 
   return TRUE;
@@ -2663,12 +2958,16 @@ xf_peer_activate (freerdp_peer *client)
    * first activation this replaces the --virtual-monitor size the session
    * started at; on a re-activation after our own DesktopResize the sizes
    * already agree and this is a no-op. */
-  meta_rdp_server_resize_monitor (peer_ctx->server,
-                                  (int) freerdp_settings_get_uint32 (settings,
-                                                                     FreeRDP_DesktopWidth),
-                                  (int) freerdp_settings_get_uint32 (settings,
-                                                                     FreeRDP_DesktopHeight),
-                                  1.0f);
+  {
+    int width = (int) freerdp_settings_get_uint32 (settings, FreeRDP_DesktopWidth);
+    int height = (int) freerdp_settings_get_uint32 (settings, FreeRDP_DesktopHeight);
+    uint32_t scale_percent =
+      freerdp_settings_get_uint32 (settings, FreeRDP_DesktopScaleFactor);
+
+    meta_rdp_server_resize_monitor (peer_ctx->server, width, height,
+                                    meta_rdp_scale_from_percent (scale_percent,
+                                                                 width, height));
+  }
 
   /* Everything past here is first-activation-only setup. */
   if (peer_ctx->activated)
