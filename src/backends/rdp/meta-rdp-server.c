@@ -1030,11 +1030,20 @@ meta_rdp_present_gfxredir (MetaRdpPeerContext *peer_ctx,
    * surface is blitted and the stale areas would show. Copying from the last
    * fully written buffer is a plain memcpy, much cheaper than re-reading from
    * the GPU. */
-  if (buffer->stale && !mtk_region_is_empty (buffer->stale) &&
-      peer_ctx->last_written >= 0 && peer_ctx->last_written != index)
+  if (buffer->stale && peer_ctx->last_written >= 0 &&
+      peer_ctx->last_written != index)
     {
-      meta_rdp_copy_between_buffers (peer_ctx, peer_ctx->last_written, index,
-                                     buffer->stale);
+      /* Not the whole stale region: the readback below overwrites @rect, so
+       * copying that part would be undone immediately. In steady state the
+       * damage lands in much the same place every frame, which makes the
+       * stale region and @rect nearly identical -- so without this subtraction
+       * essentially the entire frame gets memcpy'd for nothing, on top of the
+       * copy the GL readback already performs internally. */
+      mtk_region_subtract_rectangle (buffer->stale, &rect);
+
+      if (!mtk_region_is_empty (buffer->stale))
+        meta_rdp_copy_between_buffers (peer_ctx, peer_ctx->last_written, index,
+                                       buffer->stale);
     }
   g_clear_pointer (&buffer->stale, mtk_region_unref);
 
