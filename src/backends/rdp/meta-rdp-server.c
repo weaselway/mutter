@@ -22,6 +22,7 @@
 #include "backends/rdp/meta-rdp-clipboard.h"
 
 #include "backends/meta-backend-private.h"
+#include "backends/meta-cursor-tracker-private.h"
 #include "backends/meta-renderer.h"
 #include "backends/meta-renderer-view.h"
 #include "backends/meta-stage-private.h"
@@ -170,6 +171,8 @@ struct _MetaRdpServer
 
   gulong started_handler_id;
   gulong monitors_changed_handler_id;
+  gulong cursor_changed_handler_id;
+  gulong cursor_visibility_handler_id;
 
   gboolean views_attached;
   GList *watched_views; /* MetaRdpWatchedView* */
@@ -675,6 +678,147 @@ meta_rdp_peer_force_full_present (MetaRdpPeerContext *peer_ctx)
     }
 
   g_message ("rdp: force_full_present exit");
+}
+
+/* ------------------------------------------------------------------ */
+/* Client-side pointer                                                  */
+/*                                                                      */
+/* The cursor sprite is pushed over RDP as a pointer update rather than */
+/* composited into the frame -- see META_STAGE_DISABLE_CURSOR_OVERLAYS  */
+/* in meta-stage.c, which keeps it out of the captured framebuffer and  */
+/* stops pointer motion from costing a frame. Only the shape is sent:   */
+/* the client already knows where its own mouse is, so plain motion     */
+/* needs no server traffic at all.                                      */
+/* ------------------------------------------------------------------ */
+
+/* MS-RDPBCGR 2.2.9.1.2.1.11: a Large Pointer Update tops out at 384x384. */
+#define META_RDP_MAX_POINTER_SIZE 384
+
+static void
+meta_rdp_peer_hide_pointer (MetaRdpPeerContext *peer_ctx)
+{
+  rdpUpdate *update = peer_ctx->peer->context->update;
+  POINTER_SYSTEM_UPDATE pointer_system = { 0 };
+
+  pointer_system.type = SYSPTR_NULL;
+
+  update->BeginPaint (update->context);
+  update->pointer->PointerSystem (update->context, &pointer_system);
+  update->EndPaint (update->context);
+}
+
+static void
+meta_rdp_peer_send_pointer (MetaRdpPeerContext *peer_ctx,
+                            CoglTexture        *texture,
+                            int                 hot_x,
+                            int                 hot_y)
+{
+  rdpUpdate *update = peer_ctx->peer->context->update;
+  POINTER_LARGE_UPDATE pointer_update = { 0 };
+  int width = cogl_texture_get_width (texture);
+  int height = cogl_texture_get_height (texture);
+  int stride = width * 4;
+  g_autofree uint8_t *bits = NULL;
+  g_autofree uint8_t *flipped = NULL;
+  int y;
+
+  if (width <= 0 || height <= 0 ||
+      width > META_RDP_MAX_POINTER_SIZE ||
+      height > META_RDP_MAX_POINTER_SIZE)
+    {
+      g_warning ("rdp: cursor is %dx%d, beyond the large pointer limit; hiding",
+                 width, height);
+      meta_rdp_peer_hide_pointer (peer_ctx);
+      return;
+    }
+
+  bits = g_malloc ((size_t) stride * height);
+
+  /* BGRA byte order on little-endian is what the wire calls ARGB, which is
+   * what a 32bpp xorMask carries. */
+  if (cogl_texture_get_data (texture, COGL_PIXEL_FORMAT_BGRA_8888_PRE,
+                             stride, bits) == 0)
+    {
+      g_warning ("rdp: failed to read back cursor texture; hiding");
+      meta_rdp_peer_hide_pointer (peer_ctx);
+      return;
+    }
+
+  /* Pointer bitmaps are bottom-up, like a Windows DIB. */
+  flipped = g_malloc ((size_t) stride * height);
+  for (y = 0; y < height; y++)
+    memcpy (flipped + (size_t) y * stride,
+            bits + (size_t) (height - 1 - y) * stride,
+            stride);
+
+  pointer_update.xorBpp = 32;
+  pointer_update.cacheIndex = 0;
+  pointer_update.hotSpotX = CLAMP (hot_x, 0, width - 1);
+  pointer_update.hotSpotY = CLAMP (hot_y, 0, height - 1);
+  pointer_update.width = width;
+  pointer_update.height = height;
+  /* A 32bpp xorMask carries its own alpha, so no separate AND mask. */
+  pointer_update.lengthAndMask = 0;
+  pointer_update.andMaskData = NULL;
+  pointer_update.lengthXorMask = (UINT32) stride * height;
+  pointer_update.xorMaskData = flipped;
+
+  update->BeginPaint (update->context);
+  update->pointer->PointerLarge (update->context, &pointer_update);
+  update->EndPaint (update->context);
+}
+
+static void
+meta_rdp_peer_update_pointer (MetaRdpPeerContext *peer_ctx)
+{
+  MetaCursorTracker *cursor_tracker;
+  CoglTexture *texture;
+  int hot_x = 0;
+  int hot_y = 0;
+
+  if (!peer_ctx->activated)
+    return;
+
+  cursor_tracker = meta_backend_get_cursor_tracker (peer_ctx->server->backend);
+
+  if (!meta_cursor_tracker_get_pointer_visible (cursor_tracker))
+    {
+      meta_rdp_peer_hide_pointer (peer_ctx);
+      return;
+    }
+
+  texture = meta_cursor_tracker_get_sprite (cursor_tracker);
+  if (!texture)
+    {
+      meta_rdp_peer_hide_pointer (peer_ctx);
+      return;
+    }
+
+  meta_cursor_tracker_get_hot (cursor_tracker, &hot_x, &hot_y);
+  meta_rdp_peer_send_pointer (peer_ctx, texture, hot_x, hot_y);
+}
+
+static void
+meta_rdp_server_update_pointer (MetaRdpServer *self)
+{
+  GList *l;
+
+  for (l = self->peers; l; l = l->next)
+    meta_rdp_peer_update_pointer (l->data);
+}
+
+static void
+on_cursor_changed (MetaCursorTracker *cursor_tracker,
+                   MetaRdpServer     *self)
+{
+  meta_rdp_server_update_pointer (self);
+}
+
+static void
+on_cursor_visibility_changed (MetaCursorTracker *cursor_tracker,
+                              MetaRdpServer     *self)
+{
+  meta_rdp_server_update_pointer (self);
 }
 
 static void
@@ -1778,6 +1922,9 @@ xf_peer_activate (freerdp_peer *client)
         }
     }
 
+  /* The client has no pointer shape until we send one. */
+  meta_rdp_peer_update_pointer (peer_ctx);
+
   meta_rdp_setup_gfxredir (peer_ctx);
 
   if (peer_ctx->use_gfxredir)
@@ -2435,6 +2582,8 @@ on_context_started (MetaContext   *context,
 {
   MetaMonitorManager *monitor_manager =
     meta_backend_get_monitor_manager (self->backend);
+  MetaCursorTracker *cursor_tracker =
+    meta_backend_get_cursor_tracker (self->backend);
   g_autoptr (GError) error = NULL;
 
   g_message ("rdp: context started, wiring up virtual output");
@@ -2442,6 +2591,18 @@ on_context_started (MetaContext   *context,
   self->monitors_changed_handler_id =
     g_signal_connect_object (monitor_manager, "monitors-changed",
                              G_CALLBACK (on_monitors_changed), self,
+                             G_CONNECT_DEFAULT);
+
+  /* Push the cursor shape to connected clients whenever it changes. Position
+   * is deliberately not tracked: the client draws the pointer under its own
+   * mouse, so motion needs no server round trip. */
+  self->cursor_changed_handler_id =
+    g_signal_connect_object (cursor_tracker, "cursor-changed",
+                             G_CALLBACK (on_cursor_changed), self,
+                             G_CONNECT_DEFAULT);
+  self->cursor_visibility_handler_id =
+    g_signal_connect_object (cursor_tracker, "visibility-changed",
+                             G_CALLBACK (on_cursor_visibility_changed), self,
                              G_CONNECT_DEFAULT);
 
   meta_rdp_server_attach_views (self);
