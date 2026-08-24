@@ -140,8 +140,20 @@ typedef struct _MetaRdpPeerContext
 
   /* Fast path: gfxredir shared-memory present. */
   GfxRedirServerContext *gfxredir;
-  gboolean gfxredir_activated; /* caps confirmed */
+  gboolean gfxredir_activated; /* caps confirmed; g_atomic, see below */
   gboolean use_gfxredir;       /* shared-memory mount available */
+
+  /* gfxredir_server_open() spawns its own reader thread, so the channel
+   * callbacks do NOT run on the main thread. Presenting touches Clutter/Cogl
+   * and the buffer bookkeeping below, none of which is thread safe, so the
+   * callbacks only record a request here and bounce the actual work to the
+   * main loop via gfxredir_idle_id. Everything in this block is guarded by
+   * gfxredir_mutex; the fields it protects are written from the channel thread
+   * and consumed on the main thread. */
+  GMutex gfxredir_mutex;
+  guint gfxredir_idle_id;
+  gboolean gfxredir_present_requested; /* caps confirmed: fill the screen */
+  gboolean gfxredir_ack_requested;     /* client acked the last present */
 
   /* One pool + one buffer for the whole desktop. */
   gboolean buffer_created;
@@ -157,7 +169,8 @@ typedef struct _MetaRdpPeerContext
 
   /* Exactly one outstanding present; coalesce to the latest frame. */
   gboolean update_pending;
-  gboolean frame_missed; /* a frame arrived while a present was pending */
+  gboolean frame_missed;       /* a frame arrived while a present was pending */
+  MtkRectangle missed_damage;  /* union of the damage dropped while it was */
   uint64_t current_frame_id;
 
   GList *link; /* node in server->peers */
@@ -505,9 +518,13 @@ meta_rdp_destroy_buffer (MetaRdpPeerContext *peer_ctx)
       GFXREDIR_CLOSE_POOL_PDU close_pool = { 0 };
 
       destroy_buffer.bufferId = META_RDP_BUFFER_ID;
+      g_message ("rdp: gfxredir -> DestroyBuffer bufferId=%" G_GUINT64_FORMAT,
+                 (uint64_t) destroy_buffer.bufferId);
       redir->DestroyBuffer (redir, &destroy_buffer);
 
       close_pool.poolId = META_RDP_POOL_ID;
+      g_message ("rdp: gfxredir -> ClosePool poolId=%" G_GUINT64_FORMAT,
+                 (uint64_t) close_pool.poolId);
       redir->ClosePool (redir, &close_pool);
     }
 
@@ -549,6 +566,10 @@ meta_rdp_ensure_buffer (MetaRdpPeerContext *peer_ctx,
   open_pool.poolSize = size;
   open_pool.sectionNameLength = META_RDP_SHARED_MEMORY_NAME_SIZE + 1;
   open_pool.sectionName = section_name;
+  g_message ("rdp: gfxredir -> OpenPool poolId=%" G_GUINT64_FORMAT
+             " size=%" G_GUINT64_FORMAT " section=%s",
+             (uint64_t) open_pool.poolId, (uint64_t) open_pool.poolSize,
+             peer_ctx->shm_name);
   if (redir->OpenPool (redir, &open_pool) != 0)
     {
       g_warning ("rdp: gfxredir OpenPool failed");
@@ -563,6 +584,11 @@ meta_rdp_ensure_buffer (MetaRdpPeerContext *peer_ctx,
   create_buffer.width = width;
   create_buffer.height = height;
   create_buffer.format = GFXREDIR_BUFFER_PIXEL_FORMAT_ARGB_8888;
+  g_message ("rdp: gfxredir -> CreateBuffer bufferId=%" G_GUINT64_FORMAT
+             " poolId=%" G_GUINT64_FORMAT " %dx%d stride=%d offset=%"
+             G_GUINT64_FORMAT " format=ARGB_8888",
+             (uint64_t) create_buffer.bufferId, (uint64_t) create_buffer.poolId,
+             width, height, stride, (uint64_t) create_buffer.offset);
   if (redir->CreateBuffer (redir, &create_buffer) != 0)
     {
       GFXREDIR_CLOSE_POOL_PDU close_pool = { 0 };
@@ -650,6 +676,16 @@ meta_rdp_present_gfxredir (MetaRdpPeerContext *peer_ctx,
   present.numOpaqueRects = 1;
   present.opaqueRects = &opaque_rect;
 
+  g_message ("rdp: gfxredir -> PresentBuffer presentId=%" G_GUINT64_FORMAT
+             " bufferId=%" G_GUINT64_FORMAT " windowId=%" G_GUINT64_FORMAT
+             " rect=%ux%u+%u+%u target=%dx%d (damage was %dx%d+%d+%d)",
+             (uint64_t) present.presentId, (uint64_t) present.bufferId,
+             (uint64_t) present.windowId,
+             present.dirtyRect.width, present.dirtyRect.height,
+             present.dirtyRect.left, present.dirtyRect.top,
+             width, height,
+             damage->width, damage->height, damage->x, damage->y);
+
   if (redir->PresentBuffer (redir, &present) == 0)
     {
       peer_ctx->update_pending = TRUE;
@@ -675,12 +711,23 @@ meta_rdp_peer_present (MetaRdpPeerContext *peer_ctx,
 
   if (peer_ctx->use_gfxredir)
     {
-      if (!peer_ctx->gfxredir_activated)
+      if (!g_atomic_int_get (&peer_ctx->gfxredir_activated))
         return;
       if (peer_ctx->update_pending)
         {
-          /* Exactly one outstanding present; coalesce to the latest. */
-          peer_ctx->frame_missed = TRUE;
+          /* Exactly one present in flight. Coalesce by merging this damage
+           * into what we still owe the client, rather than dropping it and
+           * re-sending the whole screen once the ack arrives. */
+          if (peer_ctx->frame_missed)
+            {
+              mtk_rectangle_union (&peer_ctx->missed_damage, damage,
+                                   &peer_ctx->missed_damage);
+            }
+          else
+            {
+              peer_ctx->missed_damage = *damage;
+              peer_ctx->frame_missed = TRUE;
+            }
           return;
         }
       meta_rdp_present_gfxredir (peer_ctx, framebuffer, damage);
@@ -690,37 +737,120 @@ meta_rdp_peer_present (MetaRdpPeerContext *peer_ctx,
   meta_rdp_present_codec (peer_ctx, framebuffer, damage);
 }
 
-/* Present the current composited contents immediately as a full frame. Used to
- * fill the client's screen on connect/activation instead of waiting for the
- * first damage event (mutter only repaints on damage). */
+/* Present a region of the current composited contents. A NULL region means the
+ * whole framebuffer, which is what connect/activation needs: mutter only
+ * repaints on damage, so without this the client's screen stays empty until
+ * something happens to change. */
 static void
-meta_rdp_peer_force_full_present (MetaRdpPeerContext *peer_ctx)
+meta_rdp_peer_present_region (MetaRdpPeerContext *peer_ctx,
+                              const MtkRectangle *region)
 {
   MetaRdpServer *self = peer_ctx->server;
   GList *l;
-
-  g_message ("rdp: force_full_present enter peer=%p", peer_ctx->peer);
 
   for (l = self->watched_views; l; l = l->next)
     {
       MetaRdpWatchedView *watched = l->data;
       CoglFramebuffer *fb;
-      MtkRectangle full;
+      MtkRectangle rect;
 
       if (!watched->view)
         continue;
 
       fb = clutter_stage_view_get_framebuffer (watched->view);
-      full = (MtkRectangle) { 0, 0,
-                              cogl_framebuffer_get_width (fb),
-                              cogl_framebuffer_get_height (fb) };
-      g_message ("rdp: force_full_present calling meta_rdp_peer_present");
-      meta_rdp_peer_present (peer_ctx, fb, &full);
-      g_message ("rdp: force_full_present meta_rdp_peer_present returned");
+      if (region)
+        {
+          MtkRectangle bounds = { 0, 0,
+                                  cogl_framebuffer_get_width (fb),
+                                  cogl_framebuffer_get_height (fb) };
+
+          if (!mtk_rectangle_intersect (region, &bounds, &rect))
+            break;
+        }
+      else
+        {
+          rect = (MtkRectangle) { 0, 0,
+                                  cogl_framebuffer_get_width (fb),
+                                  cogl_framebuffer_get_height (fb) };
+        }
+
+      meta_rdp_peer_present (peer_ctx, fb, &rect);
       break;
     }
+}
 
-  g_message ("rdp: force_full_present exit");
+static void
+meta_rdp_peer_force_full_present (MetaRdpPeerContext *peer_ctx)
+{
+  meta_rdp_peer_present_region (peer_ctx, NULL);
+}
+
+/* Main-loop half of the gfxredir channel callbacks.
+ *
+ * The callbacks themselves run on the channel's reader thread, so they only
+ * flag what happened; the response -- reading back the framebuffer and writing
+ * a present -- happens here, on the thread that owns Clutter and Cogl. */
+static gboolean
+meta_rdp_peer_gfxredir_dispatch (gpointer user_data)
+{
+  MetaRdpPeerContext *peer_ctx = user_data;
+  gboolean present_requested;
+  gboolean ack_requested;
+  gboolean have_region = FALSE;
+  MtkRectangle region = { 0 };
+
+  g_mutex_lock (&peer_ctx->gfxredir_mutex);
+  peer_ctx->gfxredir_idle_id = 0;
+  present_requested = peer_ctx->gfxredir_present_requested;
+  ack_requested = peer_ctx->gfxredir_ack_requested;
+  peer_ctx->gfxredir_present_requested = FALSE;
+  peer_ctx->gfxredir_ack_requested = FALSE;
+  g_mutex_unlock (&peer_ctx->gfxredir_mutex);
+
+  /* A standing request (caps just confirmed) always means the whole screen:
+   * the client has nothing to composite a partial update onto yet. */
+  const gboolean full_requested = present_requested;
+
+  if (ack_requested)
+    {
+      /* The outstanding present completed. Send whatever damage accumulated
+       * while it was in flight -- just that region, not the whole screen. */
+      peer_ctx->update_pending = FALSE;
+      if (peer_ctx->frame_missed)
+        {
+          peer_ctx->frame_missed = FALSE;
+          region = peer_ctx->missed_damage;
+          have_region = TRUE;
+        }
+    }
+
+  if (full_requested)
+    meta_rdp_peer_present_region (peer_ctx, NULL);
+  else if (have_region)
+    meta_rdp_peer_present_region (peer_ctx, &region);
+
+  return G_SOURCE_REMOVE;
+}
+
+/* Schedule meta_rdp_peer_gfxredir_dispatch(). Safe to call from the channel
+ * thread; coalesces, so concurrent requests share one main-loop pass.
+ * Callers must hold gfxredir_mutex. */
+static void
+meta_rdp_peer_gfxredir_queue_dispatch_locked (MetaRdpPeerContext *peer_ctx)
+{
+  if (peer_ctx->gfxredir_idle_id == 0)
+    {
+      /* G_PRIORITY_DEFAULT, not the g_idle_add() default of
+       * G_PRIORITY_DEFAULT_IDLE: idle priority sits below Clutter's frame
+       * clock and repaint work, and in steady state every frame comes through
+       * here (a present is always in flight when damage arrives, so
+       * on_frame_ready only sets frame_missed and it is the ack that actually
+       * presents). At idle priority that starves under continuous damage and
+       * the client only updates once the compositor goes quiet. */
+      peer_ctx->gfxredir_idle_id =
+        g_idle_add_full (G_PRIORITY_DEFAULT, meta_rdp_peer_gfxredir_dispatch,
+                         peer_ctx, NULL);
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -1168,14 +1298,22 @@ gfxredir_caps_advertise (GfxRedirServerContext              *context,
       confirm.version = selected->version;
       confirm.length = selected->length;
       confirm.capsData = (const BYTE *) (selected + 1);
+      g_message ("rdp: gfxredir -> CapsConfirm version=0x%x length=%u",
+                 confirm.version, confirm.length);
       context->GraphicsRedirectionCapsConfirm (context, &confirm);
 
-      peer_ctx->gfxredir_activated = TRUE;
+      /* Set atomically, not under gfxredir_mutex: meta_rdp_setup_gfxredir()
+       * spin-waits on this from the main thread, so it has to become visible
+       * without waiting for the idle below to run. */
+      g_atomic_int_set (&peer_ctx->gfxredir_activated, TRUE);
       g_message ("rdp: gfxredir activated (caps v0x%x)", selected->version);
 
-      /* Fill the client's screen immediately rather than waiting for the
-       * first damage event. */
-      meta_rdp_peer_force_full_present (peer_ctx);
+      /* Fill the client's screen immediately rather than waiting for the first
+       * damage event -- but on the main thread, not here. */
+      g_mutex_lock (&peer_ctx->gfxredir_mutex);
+      peer_ctx->gfxredir_present_requested = TRUE;
+      meta_rdp_peer_gfxredir_queue_dispatch_locked (peer_ctx);
+      g_mutex_unlock (&peer_ctx->gfxredir_mutex);
     }
   else
     {
@@ -1191,34 +1329,18 @@ gfxredir_present_buffer_ack (GfxRedirServerContext                 *context,
 {
   MetaRdpPeerContext *peer_ctx = context->custom;
 
+  g_message ("rdp: gfxredir <- PresentBufferAck presentId=%" G_GUINT64_FORMAT
+             " windowId=%" G_GUINT64_FORMAT,
+             (uint64_t) ack->presentId, (uint64_t) ack->windowId);
+
   if (ack->windowId == META_RDP_DESKTOP_WINDOW_ID)
     {
-      peer_ctx->update_pending = FALSE;
-
-      /* If a frame arrived while a present was outstanding, present the latest
-       * now (coalesce -- never queue more than one). */
-      if (peer_ctx->frame_missed)
-        {
-          MetaRdpServer *self = peer_ctx->server;
-          GList *l;
-
-          peer_ctx->frame_missed = FALSE;
-          for (l = self->watched_views; l; l = l->next)
-            {
-              MetaRdpWatchedView *watched = l->data;
-              CoglFramebuffer *fb;
-              MtkRectangle full;
-
-              if (!watched->view)
-                continue;
-              fb = clutter_stage_view_get_framebuffer (watched->view);
-              full = (MtkRectangle) { 0, 0,
-                                      cogl_framebuffer_get_width (fb),
-                                      cogl_framebuffer_get_height (fb) };
-              meta_rdp_present_gfxredir (peer_ctx, fb, &full);
-              break;
-            }
-        }
+      /* Runs on the channel thread; update_pending/frame_missed belong to the
+       * main thread, so hand the ack over rather than acting on it here. */
+      g_mutex_lock (&peer_ctx->gfxredir_mutex);
+      peer_ctx->gfxredir_ack_requested = TRUE;
+      meta_rdp_peer_gfxredir_queue_dispatch_locked (peer_ctx);
+      g_mutex_unlock (&peer_ctx->gfxredir_mutex);
     }
 
   return CHANNEL_RC_OK;
@@ -1309,8 +1431,7 @@ meta_rdp_setup_gfxredir (MetaRdpPeerContext *peer_ctx)
       return;
     }
 
-  // FIXME
-  // redir = gfxredir_server_context_new (peer_ctx->vcm);
+  redir = gfxredir_server_context_new (peer_ctx->vcm);
 
   if (!redir)
     {
@@ -1326,8 +1447,7 @@ meta_rdp_setup_gfxredir (MetaRdpPeerContext *peer_ctx)
   if (redir->Open (redir) != CHANNEL_RC_OK)
     {
       g_warning ("rdp: gfxredir Open failed");
-      // FIXME
-      // gfxredir_server_context_free (redir);
+      gfxredir_server_context_free (redir);
       return;
     }
 
@@ -1341,7 +1461,7 @@ meta_rdp_setup_gfxredir (MetaRdpPeerContext *peer_ctx)
     freerdp_peer *client = peer_ctx->peer;
     int wait_retry = 0;
 
-    while (!peer_ctx->gfxredir_activated && wait_retry < 200) /* ~2s */
+    while (!g_atomic_int_get (&peer_ctx->gfxredir_activated) && wait_retry < 200) /* ~2s */
       {
         wait_retry++;
         g_usleep (10000);
@@ -1350,7 +1470,7 @@ meta_rdp_setup_gfxredir (MetaRdpPeerContext *peer_ctx)
           break;
       }
 
-    if (peer_ctx->gfxredir_activated)
+    if (g_atomic_int_get (&peer_ctx->gfxredir_activated))
       g_message ("rdp: DIAG gfxredir caps advertise received after %d ms",
                  wait_retry * 10);
     else
@@ -2050,6 +2170,8 @@ rdp_peer_context_new (freerdp_peer *client, rdpContext *context)
   peer_ctx->n_fd_sources = 0;
   peer_ctx->vcm = NULL;
 
+  g_mutex_init (&peer_ctx->gfxredir_mutex);
+
   /* Codec fallback encoder. */
   peer_ctx->nsc_context = nsc_context_new ();
   if (peer_ctx->nsc_context)
@@ -2085,13 +2207,19 @@ rdp_peer_context_free (freerdp_peer *client, rdpContext *context)
   meta_rdp_destroy_buffer (peer_ctx);
   if (peer_ctx->gfxredir)
     {
+      /* Close() joins the channel's reader thread, so no callback can be
+       * running -- or start running -- once this returns. */
       peer_ctx->gfxredir->Close (peer_ctx->gfxredir);
-
-      // FIXME
-      // gfxredir_server_context_free (peer_ctx->gfxredir);
-
+      gfxredir_server_context_free (peer_ctx->gfxredir);
       peer_ctx->gfxredir = NULL;
     }
+
+  /* Only now that no callback can queue another one is it safe to drop a
+   * pending dispatch; otherwise it could fire against a freed peer. */
+  g_mutex_lock (&peer_ctx->gfxredir_mutex);
+  g_clear_handle_id (&peer_ctx->gfxredir_idle_id, g_source_remove);
+  g_mutex_unlock (&peer_ctx->gfxredir_mutex);
+  g_mutex_clear (&peer_ctx->gfxredir_mutex);
 
   if (peer_ctx->drdynvc)
     {
