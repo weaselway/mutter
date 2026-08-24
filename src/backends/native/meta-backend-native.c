@@ -35,6 +35,9 @@
 #include "backends/native/meta-backend-native.h"
 #include "backends/native/meta-backend-native-private.h"
 #include "backends/native/meta-input-thread.h"
+#ifdef HAVE_RDP
+#include "backends/rdp/meta-rdp-server.h"
+#endif
 
 #include <drm_fourcc.h>
 #include <stdlib.h>
@@ -97,6 +100,9 @@ typedef struct _MetaBackendNativePrivate
 #endif
 
   MetaDrmLeaseManager *drm_lease_manager;
+#ifdef HAVE_RDP
+  MetaRdpServer *rdp_server;
+#endif
 } MetaBackendNativePrivate;
 
 G_DEFINE_TYPE_WITH_PRIVATE (MetaBackendNative,
@@ -116,6 +122,9 @@ meta_backend_native_dispose (GObject *object)
 
   G_OBJECT_CLASS (meta_backend_native_parent_class)->dispose (object);
 
+#ifdef HAVE_RDP
+  g_clear_object (&priv->rdp_server);
+#endif
   g_clear_pointer (&priv->startup_render_devices, g_hash_table_unref);
   g_clear_object (&priv->kms);
   g_clear_object (&priv->device_pool);
@@ -230,6 +239,16 @@ meta_backend_native_init_post (MetaBackend  *backend,
   g_signal_connect_swapped (seat, "keymap-changed",
                             G_CALLBACK (meta_backend_notify_keymap_changed),
                             backend);
+
+#ifdef HAVE_RDP
+  {
+    g_autoptr (GError) rdp_error = NULL;
+
+    priv->rdp_server = meta_rdp_server_new (backend, &rdp_error);
+    if (rdp_error)
+      g_warning ("Failed to start RDP server: %s", rdp_error->message);
+  }
+#endif
 
   return TRUE;
 }
