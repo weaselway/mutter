@@ -42,6 +42,13 @@
 #define MIME_TEXT_PLAIN "text/plain"
 #define MIME_TEXT_HTML "text/html"
 
+/* "HTML Format" is a registered (named) clipboard format, so its numeric id is
+ * assigned by the client and never appears on the wire from our side -- we only
+ * ever match it by name. This is purely a local discriminator; the Microsoft
+ * FreeRDP fork spelled it CB_FORMAT_HTML, which upstream FreeRDP 3 does not
+ * define (Weston carries the same constant as CF_PRIVATE_HTML). */
+#define META_RDP_CB_FORMAT_HTML 0xD010
+
 /* HTML clipboard format wrapper (CF_HTML), ported from Weston's rdpclip.c. */
 static const char html_header_fmt[] =
   "Version:0.9\r\n"
@@ -64,7 +71,7 @@ typedef struct
 
 /* Order matters: preferred formats first (HTML before plain text). */
 static const MetaRdpClipboardFormat supported_formats[] = {
-  { CB_FORMAT_HTML,   "HTML Format",  MIME_TEXT_HTML },
+  { META_RDP_CB_FORMAT_HTML,   "HTML Format",  MIME_TEXT_HTML },
   { CF_UNICODETEXT,   NULL,           MIME_TEXT_UTF8 },
   { CF_UNICODETEXT,   NULL,           MIME_TEXT_PLAIN },
 };
@@ -283,7 +290,7 @@ rdp_bytes_to_mime (const MetaRdpClipboardFormat *format,
                    const BYTE                   *data,
                    UINT32                        len)
 {
-  if (format->format_id == CB_FORMAT_HTML)
+  if (format->format_id == META_RDP_CB_FORMAT_HTML)
     return cfhtml_to_html (data, len);
   else
     return unicode_to_utf8 (data, len);
@@ -296,7 +303,7 @@ mime_bytes_to_rdp (const MetaRdpClipboardFormat *format,
   gsize len;
   const char *data = g_bytes_get_data (bytes, &len);
 
-  if (format->format_id == CB_FORMAT_HTML)
+  if (format->format_id == META_RDP_CB_FORMAT_HTML)
     return html_to_cfhtml (data, len);
   else
     return utf8_to_unicode (data, len);
@@ -354,8 +361,8 @@ meta_rdp_selection_source_read_async (MetaSelectionSource *source,
   clipboard->pending_format = format;
 
   request.requestedFormatId = format->format_id;
-  request.msgType = CB_FORMAT_DATA_REQUEST;
-  request.dataLen = 4;
+  request.common.msgType = CB_FORMAT_DATA_REQUEST;
+  request.common.dataLen = 4;
   if (clipboard->cliprdr->ServerFormatDataRequest (clipboard->cliprdr,
                                                    &request) != 0)
     {
@@ -440,9 +447,9 @@ on_client_format_list (CliprdrServerContext         *context,
 
   g_hash_table_destroy (seen);
 
-  response.msgType = CB_FORMAT_LIST_RESPONSE;
-  response.msgFlags = CB_RESPONSE_OK;
-  response.dataLen = 0;
+  response.common.msgType = CB_FORMAT_LIST_RESPONSE;
+  response.common.msgFlags = CB_RESPONSE_OK;
+  response.common.dataLen = 0;
   context->ServerFormatListResponse (context, &response);
 
   if (!source->mimetypes)
@@ -483,7 +490,7 @@ on_client_format_data_response (CliprdrServerContext                  *context,
   if (!task)
     return CHANNEL_RC_OK;
 
-  if ((response->msgFlags & CB_RESPONSE_FAIL) || !format ||
+  if ((response->common.msgFlags & CB_RESPONSE_FAIL) || !format ||
       !response->requestedFormatData)
     {
       g_task_return_new_error (task, G_IO_ERROR, G_IO_ERROR_FAILED,
@@ -492,7 +499,7 @@ on_client_format_data_response (CliprdrServerContext                  *context,
     }
 
   mime_bytes = rdp_bytes_to_mime (format, response->requestedFormatData,
-                                  response->dataLen);
+                                  response->common.dataLen);
   if (!mime_bytes)
     {
       g_task_return_new_error (task, G_IO_ERROR, G_IO_ERROR_FAILED,
@@ -546,8 +553,8 @@ send_server_format_list (MetaRdpClipboard *clipboard)
 
   g_hash_table_destroy (seen);
 
-  format_list.msgType = CB_FORMAT_LIST;
-  format_list.msgFlags = 0;
+  format_list.common.msgType = CB_FORMAT_LIST;
+  format_list.common.msgFlags = 0;
   format_list.numFormats = n;
   format_list.formats = formats;
 
@@ -600,17 +607,17 @@ on_selection_transfer_finished (GObject      *source_object,
   if (!rdp_bytes)
     goto fail;
 
-  response.msgType = CB_FORMAT_DATA_RESPONSE;
-  response.msgFlags = CB_RESPONSE_OK;
-  response.dataLen = g_bytes_get_size (rdp_bytes);
+  response.common.msgType = CB_FORMAT_DATA_RESPONSE;
+  response.common.msgFlags = CB_RESPONSE_OK;
+  response.common.dataLen = g_bytes_get_size (rdp_bytes);
   response.requestedFormatData = g_bytes_get_data (rdp_bytes, NULL);
   clipboard->cliprdr->ServerFormatDataResponse (clipboard->cliprdr, &response);
   return;
 
 fail:
-  response.msgType = CB_FORMAT_DATA_RESPONSE;
-  response.msgFlags = CB_RESPONSE_FAIL;
-  response.dataLen = 0;
+  response.common.msgType = CB_FORMAT_DATA_RESPONSE;
+  response.common.msgFlags = CB_RESPONSE_FAIL;
+  response.common.dataLen = 0;
   response.requestedFormatData = NULL;
   clipboard->cliprdr->ServerFormatDataResponse (clipboard->cliprdr, &response);
 }
@@ -638,8 +645,8 @@ on_client_format_data_request (CliprdrServerContext                 *context,
   if (!format || clipboard->server_request_pending)
     {
       CLIPRDR_FORMAT_DATA_RESPONSE response = { 0 };
-      response.msgType = CB_FORMAT_DATA_RESPONSE;
-      response.msgFlags = CB_RESPONSE_FAIL;
+      response.common.msgType = CB_FORMAT_DATA_RESPONSE;
+      response.common.msgFlags = CB_RESPONSE_FAIL;
       context->ServerFormatDataResponse (context, &response);
       return CHANNEL_RC_OK;
     }
@@ -796,12 +803,12 @@ meta_rdp_clipboard_new (freerdp_peer *peer,
     general.version = CB_CAPS_VERSION_2;
     general.generalFlags = general_flags;
 
-    caps.msgType = CB_CLIP_CAPS;
+    caps.common.msgType = CB_CLIP_CAPS;
     caps.cCapabilitiesSets = 1;
     caps.capabilitySets = (CLIPRDR_CAPABILITY_SET *) &general;
     cliprdr->ServerCapabilities (cliprdr, &caps);
 
-    monitor_ready.msgType = CB_MONITOR_READY;
+    monitor_ready.common.msgType = CB_MONITOR_READY;
     cliprdr->MonitorReady (cliprdr, &monitor_ready);
   }
 
@@ -864,8 +871,17 @@ meta_rdp_clipboard_get_event_handle (MetaRdpClipboard *clipboard)
 gboolean
 meta_rdp_clipboard_check_event_handle (MetaRdpClipboard *clipboard)
 {
+  UINT rc;
+
   if (!clipboard || !clipboard->cliprdr)
     return TRUE;
 
-  return clipboard->cliprdr->CheckEventHandle (clipboard->cliprdr) == 0;
+  rc = clipboard->cliprdr->CheckEventHandle (clipboard->cliprdr);
+  if (rc != CHANNEL_RC_OK)
+    {
+      g_warning ("rdp: cliprdr CheckEventHandle returned 0x%X", rc);
+      return FALSE;
+    }
+
+  return TRUE;
 }
