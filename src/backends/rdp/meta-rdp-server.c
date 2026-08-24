@@ -201,12 +201,20 @@ meta_rdp_read_framebuffer (CoglFramebuffer *framebuffer,
   if (!ok)
     return FALSE;
 
+#if 0
+  /* Vertical flip: GL framebuffers are bottom-up, so historically we flipped
+   * rows here. In practice the RDP output came out mirrored, so this is
+   * disabled and we copy rows straight through. */
   for (y = 0; y < height; y++)
     {
       memcpy (dest + (size_t) y * stride,
               tmp + (size_t) (height - 1 - y) * stride,
               (size_t) stride);
     }
+#else
+  (void) y;
+  memcpy (dest, tmp, (size_t) stride * height);
+#endif
 
   return TRUE;
 }
@@ -1409,17 +1417,45 @@ meta_rdp_create_vsock_fd (int port)
 }
 
 /*
- * Mirrors Weston's use_vsock_fd(): if USE_VSOCK is set to a non-empty value,
- * it is an already-listening fd inherited from WSLGd -- use it directly. If
- * set but empty, create our own vsock. If unset, return -1 (fall back to TCP
- * for local debugging).
+ * Determine the listening fd for the RDP server, in priority order:
+ *   1. MUTTER_RDP_VSOCK_PORT set -> bind our own AF_VSOCK on that port. This is
+ *      the WSLGd A1 hand-off: WSLGd publishes the reserved port and mutter (this
+ *      process, launched externally in the user distro) binds it.
+ *   2. USE_VSOCK set to a non-empty value -> an already-listening fd inherited
+ *      from WSLGd; use it directly.
+ *   3. USE_VSOCK set but empty -> create our own vsock on vsock_port.
+ *   4. none of the above -> return -1 (fall back to TCP for local debugging).
  */
 static int
 meta_rdp_get_listen_fd (MetaRdpServer *self,
                         int            vsock_port)
 {
-  const char *fd_str = g_getenv ("USE_VSOCK");
+  const char *vsock_port_str = g_getenv ("MUTTER_RDP_VSOCK_PORT");
+  const char *fd_str;
   int fd;
+
+  if (vsock_port_str && *vsock_port_str != '\0')
+    {
+      int port = atoi (vsock_port_str);
+
+      if (port <= 0)
+        {
+          g_warning ("rdp: MUTTER_RDP_VSOCK_PORT=%s is not a valid port",
+                     vsock_port_str);
+          return -1;
+        }
+
+      fd = meta_rdp_create_vsock_fd (port);
+      if (fd >= 0)
+        {
+          self->owned_listen_fd = fd;
+          g_message ("rdp: created vsock fd %d on WSLGd-published port %d",
+                     fd, port);
+        }
+      return fd;
+    }
+
+  fd_str = g_getenv ("USE_VSOCK");
 
   if (!fd_str)
     return -1;
