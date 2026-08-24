@@ -516,6 +516,8 @@ if have_rdp
   mutter_sources += [
     'backends/rdp/meta-rdp-server.c',
     'backends/rdp/meta-rdp-server.h',
+    'backends/rdp/meta-rdp-clipboard.c',
+    'backends/rdp/meta-rdp-clipboard.h',
   ]
 endif
 
