@@ -85,4 +85,27 @@ cogl_pixel_buffer_new (CoglContext *context,
                        size_t       size,
                        const void  *data);
 
+/**
+ * cogl_pixel_buffer_new_for_readback:
+ * @context: A #CoglContext
+ * @size: The number of bytes to allocate for the pixel data.
+ *
+ * Declares a new #CoglPixelBuffer of @size bytes intended as the destination
+ * of [method@Cogl.Framebuffer.read_pixels_into_bitmap], i.e. bound to
+ * `GL_PIXEL_PACK_BUFFER` and written by the GPU rather than by the
+ * application.
+ *
+ * Unlike [func@Cogl.PixelBuffer.new] this asks the driver for a buffer the CPU
+ * can read back cheaply (%COGL_BUFFER_USAGE_HINT_READ, `GL_STREAM_READ`). That
+ * distinction decides which memory the buffer is placed in: a buffer created
+ * for drawing may sit in memory that has to be copied through a staging
+ * allocation and waited on before the application can read it, which defeats
+ * the point of reading pixels into a buffer at all. See #CoglBufferUsageHint.
+ *
+ * Return value: (transfer full): a newly allocated #CoglPixelBuffer
+ */
+COGL_EXPORT CoglPixelBuffer *
+cogl_pixel_buffer_new_for_readback (CoglContext *context,
+                                    size_t       size);
+
 G_END_DECLS
