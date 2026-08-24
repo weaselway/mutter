@@ -314,16 +314,21 @@ if have_remote_desktop
 endif
 
 # In-process RDP/VAIL output backend (WSLg).
+#
+# We always link against the Microsoft FreeRDP fork (freerdp2), built from
+# vendor/FreeRDP into our install prefix by build-freerdp.sh and found via
+# PKG_CONFIG_PATH. That fork ships the gfxredir *server* channel that the VAIL
+# fast path needs; stock upstream FreeRDP does not build those symbols.
 have_rdp = get_option('rdp').enabled()
 have_gfxredir = false
 if have_rdp
-  freerdp_req = '>= 3.0.0'
-  freerdp_dep = dependency('freerdp3', version: freerdp_req, required: get_option('rdp'))
-  freerdp_server_dep = dependency('freerdp-server3', version: freerdp_req, required: get_option('rdp'))
-  winpr_dep = dependency('winpr3', version: freerdp_req, required: get_option('rdp'))
+  freerdp_dep = dependency('freerdp2', version: '>= 2.2.0', required: get_option('rdp'))
+  freerdp_server_dep = dependency('freerdp-server2', version: '>= 2.2.0',
+    required: get_option('rdp'))
+  winpr_dep = dependency('winpr2', version: '>= 2.2.0', required: get_option('rdp'))
   rdp_deps = [freerdp_dep, freerdp_server_dep, winpr_dep]
-  # Weston's gfxredir/VAIL fast path needs the microsoft/FreeRDP-mirror header
-  # freerdp/server/gfxredir.h, which stock FreeRDP does not ship.
+  # The gfxredir/VAIL fast path needs the microsoft/FreeRDP-mirror header
+  # freerdp/server/gfxredir.h plus the matching server symbols.
   have_gfxredir = cc.has_header('freerdp/server/gfxredir.h',
     dependencies: freerdp_server_dep)
 endif
