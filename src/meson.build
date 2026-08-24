@@ -1170,6 +1170,10 @@ endforeach
 
 subdir('helpers')
 
+if have_rdp and have_gfxredir
+  subdir('backends/rdp/gfxredir')
+endif
+
 subdir('third_party')
 
 libmutter = library(libmutter_name,
