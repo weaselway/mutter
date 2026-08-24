@@ -3173,29 +3173,6 @@ meta_rdp_setup_gfxredir (MetaRdpPeerContext *peer_ctx)
   peer_ctx->gfxredir = redir;
   peer_ctx->use_gfxredir = TRUE;
   g_message ("rdp: gfxredir channel opened; awaiting caps advertise");
-
-  /* DIAGNOSTIC: pump the peer briefly and report whether the client accepts
-   * the gfxredir DVC (i.e. sends a caps advertise). */
-  {
-    freerdp_peer *client = peer_ctx->peer;
-    int wait_retry = 0;
-
-    while (!g_atomic_int_get (&peer_ctx->gfxredir_activated) && wait_retry < 200) /* ~2s */
-      {
-        wait_retry++;
-        g_usleep (10000);
-        if (!client->CheckFileDescriptor (client) ||
-            !WTSVirtualChannelManagerCheckFileDescriptor (peer_ctx->vcm))
-          break;
-      }
-
-    if (g_atomic_int_get (&peer_ctx->gfxredir_activated))
-      g_message ("rdp: DIAG gfxredir caps advertise received after %d ms",
-                 wait_retry * 10);
-    else
-      g_message ("rdp: DIAG client sent NO gfxredir caps advertise within 2s "
-                 "(client likely does not support gfxredir in this mode)");
-  }
 }
 
 /* ------------------------------------------------------------------ */
