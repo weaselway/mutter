@@ -80,7 +80,13 @@
 /* Single fullscreen desktop window (see rdp.h RDP_RAIL_DESKTOP_WINDOW_ID). */
 #define META_RDP_DESKTOP_WINDOW_ID 0xFFFFFFFF
 #define META_RDP_POOL_ID 1
-#define META_RDP_BUFFER_ID 1
+/* Buffer ids are 1-based; buffer i uses id (i + 1). */
+#define META_RDP_BUFFER_ID(i) ((uint64_t) ((i) + 1))
+
+/* Two buffers is enough to overlap our readback with the client's upload: we
+ * write one while the client reads the other. More would only help if the
+ * client fell more than a frame behind, which the ack gating prevents. */
+#define META_RDP_N_BUFFERS 2
 
 /* GUID form: "{...}" = 32 hex + 4 dashes + 2 braces. */
 #define META_RDP_SHARED_MEMORY_NAME_SIZE (32 + 4 + 2)
@@ -95,6 +101,22 @@ typedef struct _MetaRdpWatchedView
 
 /* Per-peer context. FreeRDP allocates this inline in the peer (ContextSize),
  * so it MUST begin with rdpContext. */
+/* One shared-memory buffer inside the pool.
+ *
+ * @stale is the region this buffer is missing relative to the most recently
+ * written one: mutter only reads back the damaged part of each frame, so a
+ * buffer that sat out a frame has a hole where that frame's damage went. It is
+ * filled by copying from the up to date buffer before the next readback, which
+ * keeps every buffer whole -- the client's full-refresh path blits the entire
+ * surface, not just the presented rect. */
+typedef struct _MetaRdpBuffer
+{
+  size_t offset;       /* byte offset inside the pool */
+  gboolean in_flight;  /* presented, not yet acked: do not overwrite */
+  uint64_t present_id; /* presentId of the outstanding present */
+  MtkRegion *stale;
+} MetaRdpBuffer;
+
 typedef struct _MetaRdpPeerContext
 {
   rdpContext rdp_context;
@@ -153,24 +175,39 @@ typedef struct _MetaRdpPeerContext
   GMutex gfxredir_mutex;
   guint gfxredir_idle_id;
   gboolean gfxredir_present_requested; /* caps confirmed: fill the screen */
-  gboolean gfxredir_ack_requested;     /* client acked the last present */
+  /* presentIds the client has acked, handed over for the main thread to
+   * retire. Bounded by the number of buffers, since we never have more
+   * presents outstanding than that. */
+  uint64_t gfxredir_acked[META_RDP_N_BUFFERS];
+  int gfxredir_n_acked;
 
-  /* One pool + one buffer for the whole desktop. */
+  /* One pool holding META_RDP_N_BUFFERS buffers for the whole desktop, so a
+   * readback can proceed while the client is still reading the previous
+   * frame. */
   gboolean buffer_created;
   int buffer_width;
   int buffer_height;
   int buffer_stride;
+  size_t buffer_size; /* bytes per buffer, == pool stride between buffers */
 
-  /* Named shared-memory file backing the buffer. */
+  MetaRdpBuffer buffers[META_RDP_N_BUFFERS];
+  int next_buffer;      /* round-robin cursor */
+  int last_written;     /* buffer holding fully up to date contents, -1 if none */
+  int n_presents_inflight;
+
+  /* Named shared-memory file backing the pool. */
   int shm_fd;
   void *shm_addr;
   size_t shm_size;
   char shm_name[META_RDP_SHARED_MEMORY_NAME_SIZE + 1];
 
-  /* Exactly one outstanding present; coalesce to the latest frame. */
-  gboolean update_pending;
-  gboolean frame_missed;       /* a frame arrived while a present was pending */
-  MtkRectangle missed_damage;  /* union of the damage dropped while it was */
+  gboolean frame_missed; /* damage arrived with no buffer free to take it */
+  /* Union of the damage that accumulated while a present was in flight. Kept
+   * as a region, not a bounding box: the readback still uses the extents, but
+   * holding the real region lets us measure how much the bounding box
+   * over-reads before deciding whether to extend the protocol with a rect
+   * array (gfxredir PRESENT_BUFFER carries a single dirtyRect). */
+  MtkRegion *missed_damage;
   uint64_t current_frame_id;
 
   GList *link; /* node in server->peers */
@@ -514,13 +551,18 @@ meta_rdp_destroy_buffer (MetaRdpPeerContext *peer_ctx)
 
   if (redir)
     {
-      GFXREDIR_DESTROY_BUFFER_PDU destroy_buffer = { 0 };
       GFXREDIR_CLOSE_POOL_PDU close_pool = { 0 };
+      int i;
 
-      destroy_buffer.bufferId = META_RDP_BUFFER_ID;
-      g_message ("rdp: gfxredir -> DestroyBuffer bufferId=%" G_GUINT64_FORMAT,
-                 (uint64_t) destroy_buffer.bufferId);
-      redir->DestroyBuffer (redir, &destroy_buffer);
+      for (i = 0; i < META_RDP_N_BUFFERS; i++)
+        {
+          GFXREDIR_DESTROY_BUFFER_PDU destroy_buffer = { 0 };
+
+          destroy_buffer.bufferId = META_RDP_BUFFER_ID (i);
+          g_message ("rdp: gfxredir -> DestroyBuffer bufferId=%" G_GUINT64_FORMAT,
+                     (uint64_t) destroy_buffer.bufferId);
+          redir->DestroyBuffer (redir, &destroy_buffer);
+        }
 
       close_pool.poolId = META_RDP_POOL_ID;
       g_message ("rdp: gfxredir -> ClosePool poolId=%" G_GUINT64_FORMAT,
@@ -529,11 +571,21 @@ meta_rdp_destroy_buffer (MetaRdpPeerContext *peer_ctx)
     }
 
   meta_rdp_free_shared_memory (peer_ctx);
+
+  for (int i = 0; i < META_RDP_N_BUFFERS; i++)
+    {
+      g_clear_pointer (&peer_ctx->buffers[i].stale, mtk_region_unref);
+      peer_ctx->buffers[i].in_flight = FALSE;
+      peer_ctx->buffers[i].present_id = 0;
+    }
+
   peer_ctx->buffer_created = FALSE;
-  peer_ctx->update_pending = FALSE;
+  peer_ctx->next_buffer = 0;
+  peer_ctx->last_written = -1;
+  peer_ctx->n_presents_inflight = 0;
 }
 
-/* Create the single pool+buffer sized to the output (once / on resize). */
+/* Create the pool and its buffers, sized to the output (once / on resize). */
 static gboolean
 meta_rdp_ensure_buffer (MetaRdpPeerContext *peer_ctx,
                         int                 width,
@@ -542,9 +594,9 @@ meta_rdp_ensure_buffer (MetaRdpPeerContext *peer_ctx,
   GfxRedirServerContext *redir = peer_ctx->gfxredir;
   int stride = width * 4;
   size_t size = (size_t) stride * height;
+  size_t pool_size = size * META_RDP_N_BUFFERS;
   unsigned short section_name[META_RDP_SHARED_MEMORY_NAME_SIZE + 1];
   GFXREDIR_OPEN_POOL_PDU open_pool = { 0 };
-  GFXREDIR_CREATE_BUFFER_PDU create_buffer = { 0 };
   uint32_t i;
 
   if (peer_ctx->buffer_created &&
@@ -554,7 +606,7 @@ meta_rdp_ensure_buffer (MetaRdpPeerContext *peer_ctx,
   if (peer_ctx->buffer_created)
     meta_rdp_destroy_buffer (peer_ctx);
 
-  if (!meta_rdp_allocate_shared_memory (peer_ctx, size))
+  if (!meta_rdp_allocate_shared_memory (peer_ctx, pool_size))
     return FALSE;
 
   /* Linux wchar_t is 4 bytes; Windows wants 2-byte wchar for sectionName. */
@@ -563,7 +615,7 @@ meta_rdp_ensure_buffer (MetaRdpPeerContext *peer_ctx,
   section_name[META_RDP_SHARED_MEMORY_NAME_SIZE] = 0;
 
   open_pool.poolId = META_RDP_POOL_ID;
-  open_pool.poolSize = size;
+  open_pool.poolSize = pool_size;
   open_pool.sectionNameLength = META_RDP_SHARED_MEMORY_NAME_SIZE + 1;
   open_pool.sectionName = section_name;
   g_message ("rdp: gfxredir -> OpenPool poolId=%" G_GUINT64_FORMAT
@@ -577,36 +629,102 @@ meta_rdp_ensure_buffer (MetaRdpPeerContext *peer_ctx,
       return FALSE;
     }
 
-  create_buffer.poolId = META_RDP_POOL_ID;
-  create_buffer.bufferId = META_RDP_BUFFER_ID;
-  create_buffer.offset = 0;
-  create_buffer.stride = stride;
-  create_buffer.width = width;
-  create_buffer.height = height;
-  create_buffer.format = GFXREDIR_BUFFER_PIXEL_FORMAT_ARGB_8888;
-  g_message ("rdp: gfxredir -> CreateBuffer bufferId=%" G_GUINT64_FORMAT
-             " poolId=%" G_GUINT64_FORMAT " %dx%d stride=%d offset=%"
-             G_GUINT64_FORMAT " format=ARGB_8888",
-             (uint64_t) create_buffer.bufferId, (uint64_t) create_buffer.poolId,
-             width, height, stride, (uint64_t) create_buffer.offset);
-  if (redir->CreateBuffer (redir, &create_buffer) != 0)
+  for (i = 0; i < META_RDP_N_BUFFERS; i++)
     {
-      GFXREDIR_CLOSE_POOL_PDU close_pool = { 0 };
+      GFXREDIR_CREATE_BUFFER_PDU create_buffer = { 0 };
+      size_t offset = (size_t) i * size;
 
-      g_warning ("rdp: gfxredir CreateBuffer failed");
-      close_pool.poolId = META_RDP_POOL_ID;
-      redir->ClosePool (redir, &close_pool);
-      meta_rdp_free_shared_memory (peer_ctx);
-      return FALSE;
+      create_buffer.poolId = META_RDP_POOL_ID;
+      create_buffer.bufferId = META_RDP_BUFFER_ID (i);
+      create_buffer.offset = offset;
+      create_buffer.stride = stride;
+      create_buffer.width = width;
+      create_buffer.height = height;
+      create_buffer.format = GFXREDIR_BUFFER_PIXEL_FORMAT_ARGB_8888;
+      g_message ("rdp: gfxredir -> CreateBuffer bufferId=%" G_GUINT64_FORMAT
+                 " poolId=%" G_GUINT64_FORMAT " %dx%d stride=%d offset=%"
+                 G_GUINT64_FORMAT " format=ARGB_8888",
+                 (uint64_t) create_buffer.bufferId, (uint64_t) create_buffer.poolId,
+                 width, height, stride, (uint64_t) create_buffer.offset);
+      if (redir->CreateBuffer (redir, &create_buffer) != 0)
+        {
+          GFXREDIR_CLOSE_POOL_PDU close_pool = { 0 };
+
+          g_warning ("rdp: gfxredir CreateBuffer failed");
+          close_pool.poolId = META_RDP_POOL_ID;
+          redir->ClosePool (redir, &close_pool);
+          meta_rdp_free_shared_memory (peer_ctx);
+          return FALSE;
+        }
+
+      peer_ctx->buffers[i].offset = offset;
+      peer_ctx->buffers[i].in_flight = FALSE;
+      peer_ctx->buffers[i].present_id = 0;
+      g_clear_pointer (&peer_ctx->buffers[i].stale, mtk_region_unref);
     }
 
   peer_ctx->buffer_created = TRUE;
   peer_ctx->buffer_width = width;
   peer_ctx->buffer_height = height;
   peer_ctx->buffer_stride = stride;
-  g_message ("rdp: gfxredir buffer created %dx%d (stride %d)",
-             width, height, stride);
+  peer_ctx->buffer_size = size;
+  peer_ctx->next_buffer = 0;
+  /* Nothing has been read back yet, so no buffer holds valid contents and
+   * there is nothing to copy from; the first present writes a full frame. */
+  peer_ctx->last_written = -1;
+  peer_ctx->n_presents_inflight = 0;
+  g_message ("rdp: gfxredir %d buffers created %dx%d (stride %d, pool %zu bytes)",
+             META_RDP_N_BUFFERS, width, height, stride, pool_size);
   return TRUE;
+}
+
+/* Copy a region between two buffers in the pool.
+ *
+ * Both live in the same mapping at the same stride, so this is a row-wise
+ * memcpy. Used to fill in the frames a buffer sat out; far cheaper than
+ * re-reading those pixels from the GPU. */
+static void
+meta_rdp_copy_between_buffers (MetaRdpPeerContext *peer_ctx,
+                               int                 src_index,
+                               int                 dst_index,
+                               const MtkRegion    *region)
+{
+  uint8_t *base = peer_ctx->shm_addr;
+  const uint8_t *src = base + peer_ctx->buffers[src_index].offset;
+  uint8_t *dst = base + peer_ctx->buffers[dst_index].offset;
+  int stride = peer_ctx->buffer_stride;
+  int n_rects = mtk_region_num_rectangles (region);
+
+  for (int i = 0; i < n_rects; i++)
+    {
+      MtkRectangle r = mtk_region_get_rectangle (region, i);
+      size_t row_bytes = (size_t) r.width * 4;
+
+      for (int y = r.y; y < r.y + r.height; y++)
+        {
+          size_t row = (size_t) y * stride + (size_t) r.x * 4;
+
+          memcpy (dst + row, src + row, row_bytes);
+        }
+    }
+}
+
+/* Pick a buffer the client is not reading, or -1 if all are in flight. */
+static int
+meta_rdp_acquire_buffer (MetaRdpPeerContext *peer_ctx)
+{
+  for (int n = 0; n < META_RDP_N_BUFFERS; n++)
+    {
+      int i = (peer_ctx->next_buffer + n) % META_RDP_N_BUFFERS;
+
+      if (!peer_ctx->buffers[i].in_flight)
+        {
+          peer_ctx->next_buffer = (i + 1) % META_RDP_N_BUFFERS;
+          return i;
+        }
+    }
+
+  return -1;
 }
 
 static void
@@ -620,9 +738,45 @@ meta_rdp_present_gfxredir (MetaRdpPeerContext *peer_ctx,
   GFXREDIR_PRESENT_BUFFER_PDU present = { 0 };
   RECTANGLE_32 opaque_rect;
   MtkRectangle rect;
+  MetaRdpBuffer *buffer;
+  int index;
 
   if (!meta_rdp_ensure_buffer (peer_ctx, width, height))
     return;
+
+  index = meta_rdp_acquire_buffer (peer_ctx);
+  if (index < 0)
+    {
+      /* Every buffer is still with the client; the caller records the damage
+       * and retries on the next ack. */
+      g_warning ("rdp: gfxredir no free buffer, deferring present");
+      return;
+    }
+
+  /* Starting a frame while the client still holds another buffer is the whole
+   * point of double buffering: our readback overlaps their upload.
+   *
+   * n_presents_inflight alone over-reports that, because acks are retired on
+   * the main loop: one that has already arrived on the channel thread still
+   * counts as in flight until the idle dispatch runs. Subtract those to get
+   * the number the client is genuinely still holding. */
+  if (peer_ctx->n_presents_inflight > 0)
+    {
+      int unretired;
+      int really_held;
+
+      g_mutex_lock (&peer_ctx->gfxredir_mutex);
+      unretired = peer_ctx->gfxredir_n_acked;
+      g_mutex_unlock (&peer_ctx->gfxredir_mutex);
+
+      really_held = peer_ctx->n_presents_inflight - unretired;
+
+      g_debug ("rdp: gfxredir writing buffer %d, client holds %d present(s) "
+               "(%d in flight, %d acked but not yet retired)",
+               index, really_held, peer_ctx->n_presents_inflight, unretired);
+    }
+
+  buffer = &peer_ctx->buffers[index];
 
   /* Clip damage to bounds. */
   rect = *damage;
@@ -640,13 +794,27 @@ meta_rdp_present_gfxredir (MetaRdpPeerContext *peer_ctx,
       rect.height = height;
     }
 
+  /* Bring this buffer up to date before writing into it. It missed every frame
+   * that went to another buffer, so those regions still hold old pixels. The
+   * client only uploads the presented rect, so a hole here would be invisible
+   * until something triggers a full refresh -- at which point the whole
+   * surface is blitted and the stale areas would show. Copying from the last
+   * fully written buffer is a plain memcpy, much cheaper than re-reading from
+   * the GPU. */
+  if (buffer->stale && !mtk_region_is_empty (buffer->stale) &&
+      peer_ctx->last_written >= 0 && peer_ctx->last_written != index)
+    {
+      meta_rdp_copy_between_buffers (peer_ctx, peer_ctx->last_written, index,
+                                     buffer->stale);
+    }
+  g_clear_pointer (&buffer->stale, mtk_region_unref);
+
   /* Read just the damaged region straight into its place in the shared buffer.
-   * The rest of the buffer still holds the previous frame, which is exactly
-   * what the client expects: it composites the presented rect over what it
-   * already has. Passing the full buffer_stride is what lets a narrow region
-   * land at the right offset on every row. */
+   * Passing the full buffer_stride is what lets a narrow region land at the
+   * right offset on every row. */
   if (!meta_rdp_read_framebuffer (framebuffer,
                                   (uint8_t *) peer_ctx->shm_addr +
+                                  buffer->offset +
                                   (size_t) rect.y * peer_ctx->buffer_stride +
                                   (size_t) rect.x * 4,
                                   rect.x, rect.y,
@@ -657,6 +825,19 @@ meta_rdp_present_gfxredir (MetaRdpPeerContext *peer_ctx,
       return;
     }
 
+  /* This buffer is now current; every other buffer is missing this frame. */
+  peer_ctx->last_written = index;
+  for (int i = 0; i < META_RDP_N_BUFFERS; i++)
+    {
+      if (i == index)
+        continue;
+
+      if (!peer_ctx->buffers[i].stale)
+        peer_ctx->buffers[i].stale = mtk_region_create_rectangle (&rect);
+      else
+        mtk_region_union_rectangle (peer_ctx->buffers[i].stale, &rect);
+    }
+
   opaque_rect.left = rect.x;
   opaque_rect.top = rect.y;
   opaque_rect.width = rect.width;
@@ -665,7 +846,7 @@ meta_rdp_present_gfxredir (MetaRdpPeerContext *peer_ctx,
   present.timestamp = 0; /* disable A/V sync at client side */
   present.presentId = ++peer_ctx->current_frame_id;
   present.windowId = META_RDP_DESKTOP_WINDOW_ID;
-  present.bufferId = META_RDP_BUFFER_ID;
+  present.bufferId = META_RDP_BUFFER_ID (index);
   present.orientation = 0;
   present.targetWidth = width;
   present.targetHeight = height;
@@ -676,19 +857,21 @@ meta_rdp_present_gfxredir (MetaRdpPeerContext *peer_ctx,
   present.numOpaqueRects = 1;
   present.opaqueRects = &opaque_rect;
 
-  g_message ("rdp: gfxredir -> PresentBuffer presentId=%" G_GUINT64_FORMAT
-             " bufferId=%" G_GUINT64_FORMAT " windowId=%" G_GUINT64_FORMAT
-             " rect=%ux%u+%u+%u target=%dx%d (damage was %dx%d+%d+%d)",
-             (uint64_t) present.presentId, (uint64_t) present.bufferId,
-             (uint64_t) present.windowId,
-             present.dirtyRect.width, present.dirtyRect.height,
-             present.dirtyRect.left, present.dirtyRect.top,
-             width, height,
-             damage->width, damage->height, damage->x, damage->y);
+  g_debug ("rdp: gfxredir -> PresentBuffer presentId=%" G_GUINT64_FORMAT
+           " bufferId=%" G_GUINT64_FORMAT " windowId=%" G_GUINT64_FORMAT
+           " rect=%ux%u+%u+%u target=%dx%d (damage was %dx%d+%d+%d)",
+           (uint64_t) present.presentId, (uint64_t) present.bufferId,
+           (uint64_t) present.windowId,
+           present.dirtyRect.width, present.dirtyRect.height,
+           present.dirtyRect.left, present.dirtyRect.top,
+           width, height,
+           damage->width, damage->height, damage->x, damage->y);
 
   if (redir->PresentBuffer (redir, &present) == 0)
     {
-      peer_ctx->update_pending = TRUE;
+      buffer->in_flight = TRUE;
+      buffer->present_id = present.presentId;
+      peer_ctx->n_presents_inflight++;
     }
   else
     {
@@ -696,12 +879,55 @@ meta_rdp_present_gfxredir (MetaRdpPeerContext *peer_ctx,
     }
 }
 
+/* How much of the bounding box we are about to read back is actually damaged.
+ *
+ * gfxredir's PRESENT_BUFFER carries one dirtyRect, so a region has to collapse
+ * to its extents before it goes on the wire, and the readback (a synchronous
+ * GPU->CPU transfer) covers that whole box. This logs what that costs: if
+ * coverage is routinely high the bounding box is fine, if it is routinely low
+ * the protocol is worth extending with a rectangle array. */
+static void
+meta_rdp_log_damage_coverage (const MtkRegion    *region,
+                              const MtkRectangle *bounds)
+{
+  int n_rects = mtk_region_num_rectangles (region);
+  int64_t region_area = 0;
+  int64_t bbox_area = (int64_t) bounds->width * bounds->height;
+  double coverage;
+  int i;
+
+  for (i = 0; i < n_rects; i++)
+    {
+      MtkRectangle r = mtk_region_get_rectangle (region, i);
+
+      region_area += (int64_t) r.width * r.height;
+    }
+
+  if (bbox_area <= 0)
+    return;
+
+  coverage = 100.0 * (double) region_area / (double) bbox_area;
+
+  /* A tight bounding box is the uninteresting case and the common one; only
+   * report where collapsing the region to its extents actually over-reads. */
+  if (coverage >= 99.0)
+    return;
+
+  g_message ("rdp: damage %d rect(s), region=%" G_GINT64_FORMAT "px "
+             "bbox=%" G_GINT64_FORMAT "px (%dx%d+%d+%d) coverage=%.0f%%",
+             n_rects, region_area, bbox_area,
+             bounds->width, bounds->height, bounds->x, bounds->y,
+             coverage);
+}
+
 /* Present the current frame to one peer, choosing fast path or fallback. */
 static void
 meta_rdp_peer_present (MetaRdpPeerContext *peer_ctx,
                        CoglFramebuffer    *framebuffer,
-                       const MtkRectangle *damage)
+                       const MtkRegion    *damage)
 {
+  MtkRectangle extents;
+
   if (!peer_ctx->activated)
     {
       g_message ("rdp: meta_rdp_peer_present: peer %p not activated, skipping",
@@ -709,32 +935,43 @@ meta_rdp_peer_present (MetaRdpPeerContext *peer_ctx,
       return;
     }
 
+  if (mtk_region_is_empty (damage))
+    return;
+
   if (peer_ctx->use_gfxredir)
     {
       if (!g_atomic_int_get (&peer_ctx->gfxredir_activated))
         return;
-      if (peer_ctx->update_pending)
+
+      /* With more than one buffer we can start a frame while the client is
+       * still reading the previous one; we only have to wait when every
+       * buffer is in flight. */
+      if (peer_ctx->n_presents_inflight >= META_RDP_N_BUFFERS)
         {
-          /* Exactly one present in flight. Coalesce by merging this damage
-           * into what we still owe the client, rather than dropping it and
-           * re-sending the whole screen once the ack arrives. */
+          /* Coalesce by merging this damage into what we still owe the
+           * client, rather than dropping it and re-sending the whole screen
+           * once an ack arrives. */
           if (peer_ctx->frame_missed)
             {
-              mtk_rectangle_union (&peer_ctx->missed_damage, damage,
-                                   &peer_ctx->missed_damage);
+              mtk_region_union (peer_ctx->missed_damage, damage);
             }
           else
             {
-              peer_ctx->missed_damage = *damage;
+              g_clear_pointer (&peer_ctx->missed_damage, mtk_region_unref);
+              peer_ctx->missed_damage = mtk_region_copy (damage);
               peer_ctx->frame_missed = TRUE;
             }
           return;
         }
-      meta_rdp_present_gfxredir (peer_ctx, framebuffer, damage);
+
+      extents = mtk_region_get_extents (damage);
+      meta_rdp_log_damage_coverage (damage, &extents);
+      meta_rdp_present_gfxredir (peer_ctx, framebuffer, &extents);
       return;
     }
 
-  meta_rdp_present_codec (peer_ctx, framebuffer, damage);
+  extents = mtk_region_get_extents (damage);
+  meta_rdp_present_codec (peer_ctx, framebuffer, &extents);
 }
 
 /* Present a region of the current composited contents. A NULL region means the
@@ -743,7 +980,7 @@ meta_rdp_peer_present (MetaRdpPeerContext *peer_ctx,
  * something happens to change. */
 static void
 meta_rdp_peer_present_region (MetaRdpPeerContext *peer_ctx,
-                              const MtkRectangle *region)
+                              const MtkRegion    *region)
 {
   MetaRdpServer *self = peer_ctx->server;
   GList *l;
@@ -752,29 +989,30 @@ meta_rdp_peer_present_region (MetaRdpPeerContext *peer_ctx,
     {
       MetaRdpWatchedView *watched = l->data;
       CoglFramebuffer *fb;
-      MtkRectangle rect;
+      MtkRectangle bounds;
+      g_autoptr (MtkRegion) clipped = NULL;
 
       if (!watched->view)
         continue;
 
       fb = clutter_stage_view_get_framebuffer (watched->view);
+      bounds = (MtkRectangle) { 0, 0,
+                                cogl_framebuffer_get_width (fb),
+                                cogl_framebuffer_get_height (fb) };
+
+      /* A NULL region means the whole framebuffer; otherwise clip, since
+       * accumulated damage can outlive a framebuffer resize. */
       if (region)
         {
-          MtkRectangle bounds = { 0, 0,
-                                  cogl_framebuffer_get_width (fb),
-                                  cogl_framebuffer_get_height (fb) };
-
-          if (!mtk_rectangle_intersect (region, &bounds, &rect))
-            break;
+          clipped = mtk_region_copy (region);
+          mtk_region_intersect_rectangle (clipped, &bounds);
         }
       else
         {
-          rect = (MtkRectangle) { 0, 0,
-                                  cogl_framebuffer_get_width (fb),
-                                  cogl_framebuffer_get_height (fb) };
+          clipped = mtk_region_create_rectangle (&bounds);
         }
 
-      meta_rdp_peer_present (peer_ctx, fb, &rect);
+      meta_rdp_peer_present (peer_ctx, fb, clipped);
       break;
     }
 }
@@ -794,40 +1032,49 @@ static gboolean
 meta_rdp_peer_gfxredir_dispatch (gpointer user_data)
 {
   MetaRdpPeerContext *peer_ctx = user_data;
-  gboolean present_requested;
-  gboolean ack_requested;
-  gboolean have_region = FALSE;
-  MtkRectangle region = { 0 };
+  gboolean full_requested;
+  uint64_t acked[META_RDP_N_BUFFERS];
+  int n_acked;
+  g_autoptr (MtkRegion) region = NULL;
 
   g_mutex_lock (&peer_ctx->gfxredir_mutex);
   peer_ctx->gfxredir_idle_id = 0;
-  present_requested = peer_ctx->gfxredir_present_requested;
-  ack_requested = peer_ctx->gfxredir_ack_requested;
-  peer_ctx->gfxredir_present_requested = FALSE;
-  peer_ctx->gfxredir_ack_requested = FALSE;
-  g_mutex_unlock (&peer_ctx->gfxredir_mutex);
-
   /* A standing request (caps just confirmed) always means the whole screen:
    * the client has nothing to composite a partial update onto yet. */
-  const gboolean full_requested = present_requested;
+  full_requested = peer_ctx->gfxredir_present_requested;
+  peer_ctx->gfxredir_present_requested = FALSE;
+  n_acked = peer_ctx->gfxredir_n_acked;
+  memcpy (acked, peer_ctx->gfxredir_acked, sizeof (acked));
+  peer_ctx->gfxredir_n_acked = 0;
+  g_mutex_unlock (&peer_ctx->gfxredir_mutex);
 
-  if (ack_requested)
+  /* Retire the acked presents: those buffers are ours to write again. */
+  for (int a = 0; a < n_acked; a++)
     {
-      /* The outstanding present completed. Send whatever damage accumulated
-       * while it was in flight -- just that region, not the whole screen. */
-      peer_ctx->update_pending = FALSE;
-      if (peer_ctx->frame_missed)
+      for (int i = 0; i < META_RDP_N_BUFFERS; i++)
         {
-          peer_ctx->frame_missed = FALSE;
-          region = peer_ctx->missed_damage;
-          have_region = TRUE;
+          MetaRdpBuffer *buffer = &peer_ctx->buffers[i];
+
+          if (buffer->in_flight && buffer->present_id == acked[a])
+            {
+              buffer->in_flight = FALSE;
+              peer_ctx->n_presents_inflight--;
+              break;
+            }
         }
+    }
+
+  /* Damage that could not be sent because every buffer was busy. */
+  if (n_acked > 0 && peer_ctx->frame_missed)
+    {
+      peer_ctx->frame_missed = FALSE;
+      region = g_steal_pointer (&peer_ctx->missed_damage);
     }
 
   if (full_requested)
     meta_rdp_peer_present_region (peer_ctx, NULL);
-  else if (have_region)
-    meta_rdp_peer_present_region (peer_ctx, &region);
+  else if (region)
+    meta_rdp_peer_present_region (peer_ctx, region);
 
   return G_SOURCE_REMOVE;
 }
@@ -1005,23 +1252,33 @@ on_frame_ready (MetaStage        *stage,
   MetaRdpServer *self = watched->server;
   CoglFramebuffer *framebuffer;
   int width, height;
-  MtkRectangle damage;
+  g_autoptr (MtkRegion) damage = NULL;
   GList *l;
 
   framebuffer = clutter_stage_view_get_framebuffer (view);
   width = cogl_framebuffer_get_width (framebuffer);
   height = cogl_framebuffer_get_height (framebuffer);
 
+  /* Keep the region rather than collapsing to its extents here: the bounding
+   * box is only forced at the point the damage goes on the wire, and taking it
+   * this early would also throw away detail we want to accumulate across
+   * frames. */
   if (redraw_clip && !mtk_region_is_empty (redraw_clip))
-    damage = mtk_region_get_extents (redraw_clip);
+    {
+      damage = mtk_region_copy (redraw_clip);
+    }
   else
-    damage = (MtkRectangle) { 0, 0, width, height };
+    {
+      MtkRectangle full = { 0, 0, width, height };
+
+      damage = mtk_region_create_rectangle (&full);
+    }
 
   self->frame_counter++;
 
   for (l = self->peers; l; l = l->next)
     {
-      meta_rdp_peer_present (l->data, framebuffer, &damage);
+      meta_rdp_peer_present (l->data, framebuffer, damage);
     }
 }
 
@@ -1329,17 +1586,27 @@ gfxredir_present_buffer_ack (GfxRedirServerContext                 *context,
 {
   MetaRdpPeerContext *peer_ctx = context->custom;
 
-  g_message ("rdp: gfxredir <- PresentBufferAck presentId=%" G_GUINT64_FORMAT
-             " windowId=%" G_GUINT64_FORMAT,
-             (uint64_t) ack->presentId, (uint64_t) ack->windowId);
+  g_debug ("rdp: gfxredir <- PresentBufferAck presentId=%" G_GUINT64_FORMAT
+           " windowId=%" G_GUINT64_FORMAT,
+           (uint64_t) ack->presentId, (uint64_t) ack->windowId);
 
   if (ack->windowId == META_RDP_DESKTOP_WINDOW_ID)
     {
-      /* Runs on the channel thread; update_pending/frame_missed belong to the
-       * main thread, so hand the ack over rather than acting on it here. */
+      /* Runs on the channel thread; the buffer bookkeeping belongs to the main
+       * thread, so hand the presentId over rather than acting on it here. */
       g_mutex_lock (&peer_ctx->gfxredir_mutex);
-      peer_ctx->gfxredir_ack_requested = TRUE;
-      meta_rdp_peer_gfxredir_queue_dispatch_locked (peer_ctx);
+      if (peer_ctx->gfxredir_n_acked < META_RDP_N_BUFFERS)
+        {
+          peer_ctx->gfxredir_acked[peer_ctx->gfxredir_n_acked++] = ack->presentId;
+          meta_rdp_peer_gfxredir_queue_dispatch_locked (peer_ctx);
+        }
+      else
+        {
+          /* Cannot happen: we never have more presents outstanding than
+           * buffers, so there is always room for their acks. */
+          g_warning ("rdp: gfxredir ack overflow, dropping presentId=%"
+                     G_GUINT64_FORMAT, (uint64_t) ack->presentId);
+        }
       g_mutex_unlock (&peer_ctx->gfxredir_mutex);
     }
 
@@ -2220,6 +2487,8 @@ rdp_peer_context_free (freerdp_peer *client, rdpContext *context)
   g_clear_handle_id (&peer_ctx->gfxredir_idle_id, g_source_remove);
   g_mutex_unlock (&peer_ctx->gfxredir_mutex);
   g_mutex_clear (&peer_ctx->gfxredir_mutex);
+
+  g_clear_pointer (&peer_ctx->missed_damage, mtk_region_unref);
 
   if (peer_ctx->drdynvc)
     {
