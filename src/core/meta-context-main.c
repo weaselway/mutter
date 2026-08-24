@@ -144,6 +144,19 @@ meta_context_main_get_x11_display_policy (MetaContext *context)
   if (context_main->options.no_x11)
     return META_X11_DISPLAY_POLICY_DISABLED;
 
+  /* ON_DEMAND deadlocks anything that opens an X11 connection from the main
+   * thread before the main loop starts iterating: under that policy mutter owns
+   * the X sockets itself and only spawns Xwayland from
+   * xdisplay_connection_activity_cb, so the connect() succeeds but the setup
+   * reply never comes -- the thread that would spawn Xwayland is the one
+   * blocked on it. gnome-shell's startup JS hits this via Gvc.MixerControl,
+   * whose PulseAudio config loader probes the X11 root window for PULSE_SERVER.
+   * Forcing MANDATORY starts a real Xwayland from meta_display_open(), so that
+   * connection is answered by Xwayland rather than by a main loop waiting on
+   * itself. */
+  if (g_getenv ("MUTTER_X11_MANDATORY"))
+    return META_X11_DISPLAY_POLICY_MANDATORY;
+
 #ifdef HAVE_LOGIND
   if (sd_pid_get_user_unit (0, &unit) < 0)
     return META_X11_DISPLAY_POLICY_MANDATORY;

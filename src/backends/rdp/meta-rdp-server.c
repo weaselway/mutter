@@ -209,10 +209,13 @@ meta_rdp_server_get_stage (MetaRdpServer *self)
 }
 
 /* Read the whole framebuffer into @dest (ARGB8888, i.e. BGRA byte order in
- * memory, which is what both NSCodec's PIXEL_FORMAT_BGRA32 and gfxredir's
- * ARGB_8888 expect on little-endian). Cogl reads with a bottom-left origin
- * (OpenGL convention) whereas RDP wants a top-left origin, so we flip the
- * image vertically here. Returns FALSE on failure. */
+ * memory, which is what NSCodec's PIXEL_FORMAT_BGRA32, gfxredir's ARGB_8888
+ * and an uncompressed SURFACE_BITS bitmap all expect on little-endian).
+ *
+ * The result is top-down. Cogl already accounts for the GL bottom-left origin
+ * when reading into a bitmap, so no flip belongs here -- consumers that want
+ * bottom-up data (the raw SURFACE_BITS path) flip as they pack their sub-rect.
+ * Returns FALSE on failure. */
 static gboolean
 meta_rdp_read_framebuffer (CoglFramebuffer *framebuffer,
                            uint8_t         *dest,
@@ -222,44 +225,22 @@ meta_rdp_read_framebuffer (CoglFramebuffer *framebuffer,
 {
   CoglContext *cogl_context = cogl_framebuffer_get_context (framebuffer);
   CoglBitmap *bitmap;
-  g_autofree uint8_t *tmp = NULL;
   gboolean ok;
-  int y;
 
-  tmp = g_malloc ((size_t) stride * height);
   bitmap = cogl_bitmap_new_for_data (cogl_context,
                                      width, height,
                                      COGL_PIXEL_FORMAT_BGRA_8888_PRE,
                                      stride,
-                                     tmp);
+                                     dest);
   ok = cogl_framebuffer_read_pixels_into_bitmap (framebuffer,
                                                  0, 0,
                                                  COGL_READ_PIXELS_COLOR_BUFFER,
                                                  bitmap);
   g_object_unref (bitmap);
 
-  if (!ok)
-    return FALSE;
-
-#if 0
-  /* Vertical flip: GL framebuffers are bottom-up, so historically we flipped
-   * rows here. In practice the RDP output came out mirrored, so this is
-   * disabled and we copy rows straight through. */
-  for (y = 0; y < height; y++)
-    {
-      memcpy (dest + (size_t) y * stride,
-              tmp + (size_t) (height - 1 - y) * stride,
-              (size_t) stride);
-    }
-#else
-  (void) y;
-  memcpy (dest, tmp, (size_t) stride * height);
-#endif
-
-  return TRUE;
+  return ok;
 }
 
-/* ---- Codec fallback path (NSCodec / raw over the wire) ---- */
 
 static void
 meta_rdp_present_codec (MetaRdpPeerContext *peer_ctx,
@@ -278,14 +259,6 @@ meta_rdp_present_codec (MetaRdpPeerContext *peer_ctx,
 
   /* Clip damage to the framebuffer bounds. */
   rect = *damage;
-
-  /* NSCodec subsamples chroma 2x2, so it requires even-aligned rectangles;
-   * an odd origin/size shifts the decoded image by a pixel (seen as a 1px
-   * wobble on partial updates such as focus shadows). Snap to even bounds. */
-  if (rect.x & 1) { rect.x -= 1; rect.width += 1; }
-  if (rect.y & 1) { rect.y -= 1; rect.height += 1; }
-  if (rect.width & 1) rect.width += 1;
-  if (rect.height & 1) rect.height += 1;
 
   if (rect.x < 0) { rect.width += rect.x; rect.x = 0; }
   if (rect.y < 0) { rect.height += rect.y; rect.y = 0; }
@@ -339,7 +312,12 @@ meta_rdp_present_codec (MetaRdpPeerContext *peer_ctx,
     }
   else
     {
-      /* Raw: copy the damage sub-rect tightly. */
+      /* Raw: copy the damage sub-rect tightly, flipping it bottom-up.
+       *
+       * An uncompressed SURFACE_BITS bitmap is stored bottom-up, the usual
+       * Windows DIB convention, while the readback above is top-down. The
+       * NSCodec branch needs no flip because nsc_compose_message() already
+       * emits rows in the order the wire expects. */
       g_autofree uint8_t *sub = NULL;
       int y;
 
@@ -347,7 +325,8 @@ meta_rdp_present_codec (MetaRdpPeerContext *peer_ctx,
       for (y = 0; y < rect.height; y++)
         {
           memcpy (sub + (size_t) y * rect.width * 4,
-                  pixels + (size_t) (rect.y + y) * stride + rect.x * 4,
+                  pixels + (size_t) (rect.y + rect.height - 1 - y) * stride +
+                  rect.x * 4,
                   (size_t) rect.width * 4);
         }
 
@@ -362,8 +341,6 @@ meta_rdp_present_codec (MetaRdpPeerContext *peer_ctx,
 
   g_message ("rdp: present_codec exit");
 }
-
-/* ---- gfxredir shared-memory fast path ---- */
 
 static void
 meta_rdp_free_shared_memory (MetaRdpPeerContext *peer_ctx)
@@ -835,8 +812,6 @@ on_frame_ready (MetaStage        *stage,
   MtkRectangle damage;
   GList *l;
 
-  g_message ("rdp: on_frame_ready enter view=%p", view);
-
   framebuffer = clutter_stage_view_get_framebuffer (view);
   width = cogl_framebuffer_get_width (framebuffer);
   height = cogl_framebuffer_get_height (framebuffer);
@@ -850,12 +825,8 @@ on_frame_ready (MetaStage        *stage,
 
   for (l = self->peers; l; l = l->next)
     {
-      g_message ("rdp: on_frame_ready presenting to peer %p", l->data);
       meta_rdp_peer_present (l->data, framebuffer, &damage);
-      g_message ("rdp: on_frame_ready present to peer %p returned", l->data);
     }
-
-  g_message ("rdp: on_frame_ready exit");
 }
 
 static void meta_rdp_server_detach_views (MetaRdpServer *self);
@@ -2171,7 +2142,7 @@ rdp_peer_init (freerdp_peer *client, MetaRdpServer *self)
   (void) freerdp_settings_set_uint32 (settings, FreeRDP_ColorDepth, 32);
   (void) freerdp_settings_set_bool (settings, FreeRDP_RefreshRect, TRUE);
   (void) freerdp_settings_set_bool (settings, FreeRDP_RemoteFxCodec, FALSE);
-  (void) freerdp_settings_set_bool (settings, FreeRDP_NSCodec, TRUE);
+  (void) freerdp_settings_set_bool (settings, FreeRDP_NSCodec, FALSE);
   (void) freerdp_settings_set_bool (settings, FreeRDP_FrameMarkerCommandEnabled, TRUE);
   (void) freerdp_settings_set_bool (settings, FreeRDP_SurfaceFrameMarkerEnabled, TRUE);
   /* v1: plain fullscreen desktop, not RAIL. */
