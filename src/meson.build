@@ -89,6 +89,10 @@ if have_remote_desktop
   ]
 endif
 
+if have_rdp
+  mutter_pkg_private_deps += rdp_deps
+endif
+
 if have_introspection
   mutter_pkg_private_deps += [
     gobject_introspection_dep,
@@ -505,6 +509,13 @@ if have_remote_desktop
     'backends/meta-screen-cast-stream-src.h',
     'core/meta-selection-source-remote.c',
     'core/meta-selection-source-remote.h',
+  ]
+endif
+
+if have_rdp
+  mutter_sources += [
+    'backends/rdp/meta-rdp-server.c',
+    'backends/rdp/meta-rdp-server.h',
   ]
 endif
 

@@ -213,3 +213,9 @@ option('devkit',
   value: 'auto',
   description: 'Compositor and shell software development kit'
 )
+
+option('rdp',
+  type: 'feature',
+  value: 'disabled',
+  description: 'In-process RDP/VAIL output backend'
+)
