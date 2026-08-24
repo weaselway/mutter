@@ -467,8 +467,8 @@ meta_rdp_server_get_stage (MetaRdpServer *self)
 }
 
 /* HACK: rolling meter for the framebuffer readback, the same shape as
- * meta_rdp_account_update() below -- exponentially weighted so it tracks
- * recent activity, reported once a second, process-wide statics.
+ * exponentially weighted so it tracks recent activity, reported once a
+ * second, process-wide statics.
  *
  * This is the number the readback work is aimed at: glReadPixels here is a
  * synchronous GPU->CPU transfer that on d3d12 costs a blit into a staging
@@ -938,63 +938,8 @@ meta_rdp_read_framebuffer (CoglFramebuffer *framebuffer,
   return ok;
 }
 
-
 /* Warn when a single present blocks the main loop for longer than this. */
 #define META_RDP_SLOW_UPDATE_US (30 * 1000)
-
-/* HACK: rolling throughput meter for the raw present path. Exponentially
- * weighted so it tracks recent activity rather than the whole session average,
- * and reported once a second. Process-wide statics -- with one client that is
- * all we need, and this is a tuning aid, not instrumentation worth keeping. */
-static void
-meta_rdp_account_update (size_t bytes)
-{
-  /* Weight of the newest sample in the rolling means; ~5s of history. */
-  static const double alpha = 0.2;
-  static int64_t window_start_us = 0;
-  static size_t window_bytes = 0;
-  static unsigned window_updates = 0;
-  static double mean_bps = -1.0;
-  static double mean_ups = -1.0;
-
-  int64_t now_us = g_get_monotonic_time ();
-  int64_t elapsed_us;
-
-  window_bytes += bytes;
-  window_updates++;
-
-  if (window_start_us == 0)
-    {
-      window_start_us = now_us;
-      return;
-    }
-
-  elapsed_us = now_us - window_start_us;
-  if (elapsed_us < G_USEC_PER_SEC)
-    return;
-
-  double bps = window_bytes * (double) G_USEC_PER_SEC / elapsed_us;
-  double ups = window_updates * (double) G_USEC_PER_SEC / elapsed_us;
-
-  if (mean_bps < 0.0)
-    {
-      mean_bps = bps;
-      mean_ups = ups;
-    }
-  else
-    {
-      mean_bps = alpha * bps + (1.0 - alpha) * mean_bps;
-      mean_ups = alpha * ups + (1.0 - alpha) * mean_ups;
-    }
-
-  g_message ("rdp: %.1f updates/s (mean %.1f), %.2f MB/s (mean %.2f)",
-             ups, mean_ups,
-             bps / (1024.0 * 1024.0), mean_bps / (1024.0 * 1024.0));
-
-  window_start_us = now_us;
-  window_bytes = 0;
-  window_updates = 0;
-}
 
 static void
 meta_rdp_present_codec (MetaRdpPeerContext *peer_ctx,
@@ -1082,8 +1027,6 @@ meta_rdp_present_codec (MetaRdpPeerContext *peer_ctx,
       }
 
     g_debug ("rdp: present_codec SurfaceBits returned (raw)");
-
-    meta_rdp_account_update (cmd.bmp.bitmapDataLength);
   }
 
   g_debug ("rdp: present_codec exit");
@@ -2017,47 +1960,6 @@ meta_rdp_gfxredir_send_present (MetaRdpPeerContext *peer_ctx,
     }
 }
 
-/* How much of the bounding box we are about to read back is actually damaged.
- *
- * gfxredir's PRESENT_BUFFER carries one dirtyRect, so a region has to collapse
- * to its extents before it goes on the wire, and the readback (a synchronous
- * GPU->CPU transfer) covers that whole box. This logs what that costs: if
- * coverage is routinely high the bounding box is fine, if it is routinely low
- * the protocol is worth extending with a rectangle array. */
-static void
-meta_rdp_log_damage_coverage (const MtkRegion    *region,
-                              const MtkRectangle *bounds)
-{
-  int n_rects = mtk_region_num_rectangles (region);
-  int64_t region_area = 0;
-  int64_t bbox_area = (int64_t) bounds->width * bounds->height;
-  double coverage;
-  int i;
-
-  for (i = 0; i < n_rects; i++)
-    {
-      MtkRectangle r = mtk_region_get_rectangle (region, i);
-
-      region_area += (int64_t) r.width * r.height;
-    }
-
-  if (bbox_area <= 0)
-    return;
-
-  coverage = 100.0 * (double) region_area / (double) bbox_area;
-
-  /* A tight bounding box is the uninteresting case and the common one; only
-   * report where collapsing the region to its extents actually over-reads. */
-  if (coverage >= 99.0)
-    return;
-
-  g_message ("rdp: damage %d rect(s), region=%" G_GINT64_FORMAT "px "
-             "bbox=%" G_GINT64_FORMAT "px (%dx%d+%d+%d) coverage=%.0f%%",
-             n_rects, region_area, bbox_area,
-             bounds->width, bounds->height, bounds->x, bounds->y,
-             coverage);
-}
-
 /* The stage has been resized underneath us; get the client onto the new size.
  *
  * Returns TRUE if a resize is now in progress, in which case the caller must
@@ -2139,11 +2041,7 @@ meta_rdp_peer_present (MetaRdpPeerContext *peer_ctx,
   MtkRectangle extents;
 
   if (!peer_ctx->activated)
-    {
-      g_message ("rdp: meta_rdp_peer_present: peer %p not activated, skipping",
-                 peer_ctx->peer);
-      return;
-    }
+    return;
 
   /* Before anything else: the client's idea of the desktop size has to match
    * the framebuffer we are about to read back. */
@@ -2182,7 +2080,6 @@ meta_rdp_peer_present (MetaRdpPeerContext *peer_ctx,
         }
 
       extents = mtk_region_get_extents (damage);
-      meta_rdp_log_damage_coverage (damage, &extents);
       meta_rdp_present_gfxredir (peer_ctx, framebuffer, &extents);
       return;
     }
@@ -2833,10 +2730,8 @@ meta_rdp_fd_source_dispatch (GSource     *source,
 
   if (revents & (G_IO_IN | G_IO_HUP | G_IO_ERR))
     {
-      if (!fd_source->check (fd_source->data)) {
-          g_message("rdp: remove fd %d", fd_source->fd);
+      if (!fd_source->check (fd_source->data))
         return G_SOURCE_REMOVE;
-      }
     }
 
   return G_SOURCE_CONTINUE;
@@ -3057,8 +2952,6 @@ meta_rdp_ensure_drdynvc (MetaRdpPeerContext *peer_ctx)
   if (peer_ctx->drdynvc)
     return TRUE;
 
-  g_message("rdp: meta_rdp_ensure_drdynvc with vcm: %p", peer_ctx->vcm);
-
   if (!peer_ctx->vcm)
     return FALSE;
 
@@ -3250,8 +3143,6 @@ meta_rdp_setup_gfxredir (MetaRdpPeerContext *peer_ctx)
 {
   MetaRdpServer *self = peer_ctx->server;
   GfxRedirServerContext *redir = NULL;
-
-  g_message("rdp: meta_rdp_setup_gfxredir called");
 
   if (!self->shared_memory_mount_path)
     {
