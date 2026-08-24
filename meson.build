@@ -327,6 +327,7 @@ endif
 # supplies the GfxRedirServerContext ABI.
 have_rdp = get_option('rdp').enabled()
 have_gfxredir = false
+have_disp = false
 if have_rdp
   freerdp_dep = dependency('freerdp3', version: freerdp_req,
     required: get_option('rdp'))
@@ -337,6 +338,15 @@ if have_rdp
   rdp_deps = [freerdp_dep, freerdp_server_dep, winpr_dep]
   have_gfxredir = cc.has_header('freerdp/server/gfxredir.h',
     dependencies: freerdp_server_dep)
+  # MS-RDPEDISP, used to let the client pick the desktop resolution. Unlike
+  # gfxredir this channel is enabled by default upstream, so the distro
+  # freerdp-server should export disp_server_context_new().
+  have_disp = cc.has_header('freerdp/server/disp.h',
+    dependencies: freerdp_server_dep)
+  if not have_disp
+    error('freerdp/server/disp.h not found; the RDP backend needs it for ' +
+          'client-driven desktop resize')
+  endif
 endif
 
 have_devkit = get_option('devkit').enable_auto_if(
@@ -781,6 +791,7 @@ summary('EGL Device', have_egl_device, section: 'Options')
 summary('Remote desktop', have_remote_desktop, section: 'Options')
 summary('RDP/VAIL backend', have_rdp, section: 'Options')
 summary('gfxredir (VAIL fast path)', have_gfxredir, section: 'Options')
+summary('disp (client-driven resize)', have_rdp and have_disp, section: 'Options')
 summary('Development Kit', have_devkit, section: 'Options')
 summary('libgnome-desktop', have_gnome_desktop, section: 'Options')
 summary('Sound player', have_sound_player, section: 'Options')
