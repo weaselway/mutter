@@ -75,6 +75,7 @@ cogl_pixel_buffer_new (CoglContext *context,
                                "size", (uint64_t) size,
                                "default-target", COGL_BUFFER_BIND_TARGET_PIXEL_UNPACK,
                                "update-hint", COGL_BUFFER_UPDATE_HINT_STATIC,
+                               "usage-hint", COGL_BUFFER_USAGE_HINT_DRAW,
                                NULL);
 
   if (data)
@@ -90,4 +91,23 @@ cogl_pixel_buffer_new (CoglContext *context,
     }
 
   return pixel_buffer;
+}
+
+CoglPixelBuffer *
+cogl_pixel_buffer_new_for_readback (CoglContext *context,
+                                    size_t       size)
+{
+  CoglDriver *driver = cogl_context_get_driver (context);
+
+  /* PIXEL_PACK rather than PIXEL_UNPACK: this buffer is the destination of
+   * glReadPixels, not the source of a texture upload. STREAM because each
+   * frame's contents are read once and discarded. */
+  return g_object_new (COGL_TYPE_PIXEL_BUFFER,
+                       "context", context,
+                       "impl", cogl_driver_create_buffer_impl (driver),
+                       "size", (uint64_t) size,
+                       "default-target", COGL_BUFFER_BIND_TARGET_PIXEL_PACK,
+                       "update-hint", COGL_BUFFER_UPDATE_HINT_STREAM,
+                       "usage-hint", COGL_BUFFER_USAGE_HINT_READ,
+                       NULL);
 }

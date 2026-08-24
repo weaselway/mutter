@@ -61,6 +61,7 @@ enum
   PROP_SIZE,
   PROP_DEFAULT_TARGET,
   PROP_UPDATE_HINT,
+  PROP_USAGE_HINT,
 
   PROP_LAST
 };
@@ -180,6 +181,10 @@ cogl_buffer_set_property (GObject      *gobject,
       buffer->update_hint = g_value_get_enum (value);
       break;
 
+    case PROP_USAGE_HINT:
+      buffer->usage_hint = g_value_get_enum (value);
+      break;
+
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (gobject, prop_id, pspec);
       break;
@@ -220,6 +225,15 @@ cogl_buffer_class_init (CoglBufferClass *klass)
                        COGL_TYPE_BUFFER_UPDATE_HINT,
                        COGL_BUFFER_UPDATE_HINT_STATIC,
                        G_PARAM_WRITABLE | G_PARAM_CONSTRUCT |
+                       G_PARAM_STATIC_STRINGS);
+  /* Construct-only: the GL usage enum is baked into glBufferData() by
+   * recreate_store(), and changing it afterwards would silently apply only
+   * from the next store recreation. */
+  obj_props[PROP_USAGE_HINT] =
+    g_param_spec_enum ("usage-hint", NULL, NULL,
+                       COGL_TYPE_BUFFER_USAGE_HINT,
+                       COGL_BUFFER_USAGE_HINT_DRAW,
+                       G_PARAM_WRITABLE | G_PARAM_CONSTRUCT_ONLY |
                        G_PARAM_STATIC_STRINGS);
 
   g_object_class_install_properties (gobject_class,
@@ -262,6 +276,14 @@ cogl_buffer_get_update_hint (CoglBuffer *buffer)
     return FALSE;
 
   return buffer->update_hint;
+}
+
+CoglBufferUsageHint
+cogl_buffer_get_usage_hint (CoglBuffer *buffer)
+{
+  g_return_val_if_fail (COGL_IS_BUFFER (buffer), COGL_BUFFER_USAGE_HINT_DRAW);
+
+  return buffer->usage_hint;
 }
 
 void *
