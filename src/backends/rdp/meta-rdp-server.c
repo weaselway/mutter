@@ -22,10 +22,13 @@
 #include "backends/rdp/meta-rdp-clipboard.h"
 
 #include "backends/meta-backend-private.h"
+#include "backends/meta-crtc-mode.h"
 #include "backends/meta-cursor-tracker-private.h"
+#include "backends/meta-monitor-manager-private.h"
 #include "backends/meta-renderer.h"
 #include "backends/meta-renderer-view.h"
 #include "backends/meta-stage-private.h"
+#include "backends/meta-virtual-monitor.h"
 #include "clutter/clutter.h"
 #include "cogl/cogl.h"
 #include "meta/meta-backend.h"
@@ -62,6 +65,8 @@
 #include <winpr/wtsapi.h>
 
 #include <freerdp/server/gfxredir.h>
+#include <freerdp/server/disp.h>
+#include <freerdp/channels/disp.h>
 #include <freerdp/channels/drdynvc.h>
 #include <freerdp/server/drdynvc.h>
 
@@ -160,6 +165,20 @@ typedef struct _MetaRdpPeerContext
    * opening DVCs such as gfxredir. */
   DrdynvcServerContext *drdynvc;
 
+  /* MS-RDPEDISP: the client tells us what resolution it wants. Like gfxredir,
+   * the channel runs its own thread, so the layout PDU is only recorded here
+   * and applied on the main loop -- resizing the monitor touches Clutter. */
+  DispServerContext *disp;
+  GMutex disp_mutex;
+  guint disp_idle_id;
+  int disp_requested_width;
+  int disp_requested_height;
+
+  /* Set between pushing a DesktopResize and the client's re-activation. The
+   * client's surface is the old size until it comes back, so nothing may be
+   * presented in the meantime. */
+  gboolean resize_pending;
+
   /* Fast path: gfxredir shared-memory present. */
   GfxRedirServerContext *gfxredir;
   gboolean gfxredir_activated; /* caps confirmed; g_atomic, see below */
@@ -189,6 +208,10 @@ typedef struct _MetaRdpPeerContext
   int buffer_height;
   int buffer_stride;
   size_t buffer_size; /* bytes per buffer, == pool stride between buffers */
+  /* presentIds are globally monotonic and never reused. On a pool rebuild this
+   * records the highest id issued against the old pool, so a late ack for a
+   * destroyed buffer cannot retire the same-numbered buffer of the new one. */
+  uint64_t present_id_floor;
 
   MetaRdpBuffer buffers[META_RDP_N_BUFFERS];
   int next_buffer;      /* round-robin cursor */
@@ -247,6 +270,85 @@ struct _MetaRdpServer
 };
 
 G_DEFINE_FINAL_TYPE (MetaRdpServer, meta_rdp_server, G_TYPE_OBJECT)
+
+/* ------------------------------------------------------------------ */
+/* Desktop resize                                                      */
+/*                                                                     */
+/* The RDP client dictates the resolution: whatever size it negotiates  */
+/* at activation, or later asks for over MS-RDPEDISP, becomes the size  */
+/* of mutter's virtual monitor. The --virtual-monitor passed on the     */
+/* command line is only the size the session runs at before anyone      */
+/* connects.                                                            */
+/*                                                                     */
+/* Resizing is asynchronous: setting the mode makes the monitor manager */
+/* rebuild the stage views, and the new size is only observable once a  */
+/* frame arrives for the new view. meta_rdp_peer_present() notices the  */
+/* mismatch there and pushes a DesktopResize back to the client.        */
+/* ------------------------------------------------------------------ */
+
+/* Mutter's own resize-a-virtual-monitor path is ensure_virtual_monitor() in
+ * backends/meta-screen-cast-virtual-stream-src.c; this is the same sequence.
+ * Must run on the main thread -- it reconfigures Clutter.
+ *
+ * @scale is plumbed through but always 1.0 today; honouring the client's
+ * DesktopScaleFactor also needs the input mapping and the cursor sprite to
+ * stop being 1:1, which is a separate change.
+ *
+ * Returns TRUE if a new mode was actually applied. */
+static gboolean
+meta_rdp_server_resize_monitor (MetaRdpServer *self,
+                                int            width,
+                                int            height,
+                                float          scale)
+{
+  MetaMonitorManager *monitor_manager;
+  MetaVirtualMonitor *virtual_monitor;
+  MetaCrtcMode *crtc_mode;
+  const MetaCrtcModeInfo *mode_info;
+  MetaVirtualModeInfo *new_mode_info;
+  GList *virtual_monitors;
+  GList *mode_infos = NULL;
+
+  if (width <= 0 || height <= 0)
+    {
+      g_warning ("rdp: refusing to resize the monitor to %dx%d", width, height);
+      return FALSE;
+    }
+
+  monitor_manager = meta_backend_get_monitor_manager (self->backend);
+  virtual_monitors = meta_monitor_manager_get_virtual_monitors (monitor_manager);
+  if (!virtual_monitors)
+    {
+      g_warning ("rdp: no virtual monitor to resize; was --virtual-monitor "
+                 "passed?");
+      return FALSE;
+    }
+
+  /* Single-head backend: the first (and only) virtual monitor is the desktop.
+   * Weston matches a whole list of heads here (rdpdisp.c), which we do not
+   * need until we support more than one monitor. */
+  virtual_monitor = virtual_monitors->data;
+
+  crtc_mode = meta_virtual_monitor_get_crtc_mode (virtual_monitor);
+  mode_info = meta_crtc_mode_get_info (crtc_mode);
+  if (mode_info->width == width && mode_info->height == height)
+    return FALSE;
+
+  g_message ("rdp: resizing virtual monitor %dx%d -> %dx%d",
+             mode_info->width, mode_info->height, width, height);
+
+  new_mode_info = meta_virtual_mode_info_new (width, height,
+                                              mode_info->refresh_rate);
+  meta_virtual_mode_info_set_preferred_scale (new_mode_info, scale);
+  mode_infos = g_list_append (mode_infos, new_mode_info);
+
+  meta_virtual_monitor_set_modes (virtual_monitor, mode_infos);
+  g_list_free_full (mode_infos, (GDestroyNotify) meta_virtual_mode_info_free);
+
+  meta_monitor_manager_reload (monitor_manager);
+
+  return TRUE;
+}
 
 /* ------------------------------------------------------------------ */
 /* Task 04: pixel readback + present (gfxredir fast path / codec fallback) */
@@ -606,6 +708,13 @@ meta_rdp_ensure_buffer (MetaRdpPeerContext *peer_ctx,
   if (peer_ctx->buffer_created)
     meta_rdp_destroy_buffer (peer_ctx);
 
+  /* Every present issued so far belongs to the pool we just tore down. Acks
+   * for them may still be in flight; retire nothing at or below this id. */
+  g_mutex_lock (&peer_ctx->gfxredir_mutex);
+  peer_ctx->present_id_floor = peer_ctx->current_frame_id;
+  peer_ctx->gfxredir_n_acked = 0;
+  g_mutex_unlock (&peer_ctx->gfxredir_mutex);
+
   if (!meta_rdp_allocate_shared_memory (peer_ctx, pool_size))
     return FALSE;
 
@@ -920,6 +1029,56 @@ meta_rdp_log_damage_coverage (const MtkRegion    *region,
              coverage);
 }
 
+/* The stage has been resized underneath us; get the client onto the new size.
+ *
+ * Returns TRUE if a resize is now in progress, in which case the caller must
+ * not present: everything the client has -- its surface, its gfxredir buffer
+ * mappings -- is still the old size until it re-activates.
+ *
+ * Weston does the same from rdp_output_set_mode() (rdp.c). */
+static gboolean
+meta_rdp_peer_sync_desktop_size (MetaRdpPeerContext *peer_ctx,
+                                 CoglFramebuffer    *framebuffer)
+{
+  freerdp_peer *client = peer_ctx->peer;
+  rdpSettings *settings = client->context->settings;
+  int width = cogl_framebuffer_get_width (framebuffer);
+  int height = cogl_framebuffer_get_height (framebuffer);
+
+  if (peer_ctx->resize_pending)
+    return TRUE;
+
+  if ((int) freerdp_settings_get_uint32 (settings, FreeRDP_DesktopWidth) == width &&
+      (int) freerdp_settings_get_uint32 (settings, FreeRDP_DesktopHeight) == height)
+    return FALSE;
+
+  if (!freerdp_settings_get_bool (settings, FreeRDP_DesktopResize))
+    {
+      /* Nothing we can do: we cannot send this client a frame of a size it
+       * did not agree to, and we cannot make the stage go back. */
+      g_warning ("rdp: stage is %dx%d but the client cannot be resized; "
+                 "closing peer %p", width, height, client);
+      client->Close (client);
+      return TRUE;
+    }
+
+  g_message ("rdp: desktop resized to %dx%d, notifying peer %p",
+             width, height, client);
+
+  (void) freerdp_settings_set_uint32 (settings, FreeRDP_DesktopWidth,
+                                      (UINT32) width);
+  (void) freerdp_settings_set_uint32 (settings, FreeRDP_DesktopHeight,
+                                      (UINT32) height);
+
+  /* Deactivate-All / re-Activate round trip. The DVCs (gfxredir, disp) survive
+   * it; xf_peer_activate() clears resize_pending and forces a full repaint
+   * when the client comes back. */
+  peer_ctx->resize_pending = TRUE;
+  client->context->update->DesktopResize (client->context);
+
+  return TRUE;
+}
+
 /* Present the current frame to one peer, choosing fast path or fallback. */
 static void
 meta_rdp_peer_present (MetaRdpPeerContext *peer_ctx,
@@ -934,6 +1093,11 @@ meta_rdp_peer_present (MetaRdpPeerContext *peer_ctx,
                  peer_ctx->peer);
       return;
     }
+
+  /* Before anything else: the client's idea of the desktop size has to match
+   * the framebuffer we are about to read back. */
+  if (meta_rdp_peer_sync_desktop_size (peer_ctx, framebuffer))
+    return;
 
   if (mtk_region_is_empty (damage))
     return;
@@ -1595,7 +1759,17 @@ gfxredir_present_buffer_ack (GfxRedirServerContext                 *context,
       /* Runs on the channel thread; the buffer bookkeeping belongs to the main
        * thread, so hand the presentId over rather than acting on it here. */
       g_mutex_lock (&peer_ctx->gfxredir_mutex);
-      if (peer_ctx->gfxredir_n_acked < META_RDP_N_BUFFERS)
+      if (ack->presentId <= peer_ctx->present_id_floor)
+        {
+          /* Issued against a pool we have since destroyed (a resize). The
+           * buffer it names no longer exists, and retiring it would free a
+           * same-indexed buffer of the new pool that is still in flight. */
+          g_debug ("rdp: gfxredir dropping stale ack presentId=%"
+                   G_GUINT64_FORMAT " (pool rebuilt at %" G_GUINT64_FORMAT ")",
+                   (uint64_t) ack->presentId,
+                   (uint64_t) peer_ctx->present_id_floor);
+        }
+      else if (peer_ctx->gfxredir_n_acked < META_RDP_N_BUFFERS)
         {
           peer_ctx->gfxredir_acked[peer_ctx->gfxredir_n_acked++] = ack->presentId;
           meta_rdp_peer_gfxredir_queue_dispatch_locked (peer_ctx);
@@ -1682,6 +1856,126 @@ meta_rdp_ensure_drdynvc (MetaRdpPeerContext *peer_ctx)
     }
 
   return TRUE;
+}
+
+/* ---- MS-RDPEDISP: client-requested resolution ---- */
+
+/* Main-loop half of meta_rdp_disp_monitor_layout(). */
+static gboolean
+meta_rdp_disp_dispatch (gpointer user_data)
+{
+  MetaRdpPeerContext *peer_ctx = user_data;
+  int width;
+  int height;
+
+  g_mutex_lock (&peer_ctx->disp_mutex);
+  peer_ctx->disp_idle_id = 0;
+  width = peer_ctx->disp_requested_width;
+  height = peer_ctx->disp_requested_height;
+  g_mutex_unlock (&peer_ctx->disp_mutex);
+
+  /* No DesktopResize from here: the resize is asynchronous, and
+   * meta_rdp_peer_present() pushes it once a frame actually arrives at the
+   * new size. */
+  meta_rdp_server_resize_monitor (peer_ctx->server, width, height, 1.0f);
+
+  return G_SOURCE_REMOVE;
+}
+
+/* Runs on the disp channel's own thread -- see the gfxredir callbacks for the
+ * same constraint. Record the request and bounce it to the main loop. */
+static UINT
+meta_rdp_disp_monitor_layout (DispServerContext                        *context,
+                              const DISPLAY_CONTROL_MONITOR_LAYOUT_PDU *pdu)
+{
+  MetaRdpPeerContext *peer_ctx = context->custom;
+  const DISPLAY_CONTROL_MONITOR_LAYOUT *primary = NULL;
+
+  if (pdu->NumMonitors == 0)
+    return CHANNEL_RC_OK;
+
+  /* Single-head backend: take the primary monitor, or the first one if the
+   * client didn't flag any. Weston merges the full layout into a multi-head
+   * topology instead (rdpdisp.c disp_start_monitor_layout_change). */
+  for (UINT32 i = 0; i < pdu->NumMonitors; i++)
+    {
+      if (pdu->Monitors[i].Flags & DISPLAY_CONTROL_MONITOR_PRIMARY)
+        {
+          primary = &pdu->Monitors[i];
+          break;
+        }
+    }
+
+  if (!primary)
+    primary = &pdu->Monitors[0];
+
+  g_message ("rdp: disp <- MonitorLayout %u monitor(s), primary %ux%u "
+             "(scale %u%%/%u%%)",
+             pdu->NumMonitors, primary->Width, primary->Height,
+             primary->DesktopScaleFactor, primary->DeviceScaleFactor);
+
+  if (pdu->NumMonitors > 1)
+    g_message ("rdp: disp only the primary monitor is used (single-head)");
+
+  g_mutex_lock (&peer_ctx->disp_mutex);
+  peer_ctx->disp_requested_width = (int) primary->Width;
+  peer_ctx->disp_requested_height = (int) primary->Height;
+  if (peer_ctx->disp_idle_id == 0)
+    {
+      /* G_PRIORITY_DEFAULT for the same reason as the gfxredir dispatch. */
+      peer_ctx->disp_idle_id =
+        g_idle_add_full (G_PRIORITY_DEFAULT, meta_rdp_disp_dispatch,
+                         peer_ctx, NULL);
+    }
+  g_mutex_unlock (&peer_ctx->disp_mutex);
+
+  return CHANNEL_RC_OK;
+}
+
+/* Open the display control channel so the client can ask for a resolution.
+ * Weston does the same in rdprail.c, opening disp before the graphics
+ * channels; keep that order so the caps PDU is queued before the gfxredir
+ * handshake starts pumping the peer. */
+static void
+meta_rdp_setup_disp (MetaRdpPeerContext *peer_ctx)
+{
+  DispServerContext *disp;
+
+  if (peer_ctx->disp)
+    return;
+
+  disp = disp_server_context_new (peer_ctx->vcm);
+  if (!disp)
+    {
+      g_warning ("rdp: disp_server_context_new failed; resolution is fixed");
+      return;
+    }
+
+  disp->custom = peer_ctx;
+  disp->MaxNumMonitors = 1;
+  disp->MaxMonitorAreaFactorA = DISPLAY_CONTROL_MAX_MONITOR_WIDTH;
+  disp->MaxMonitorAreaFactorB = DISPLAY_CONTROL_MAX_MONITOR_HEIGHT;
+  disp->DispMonitorLayout = meta_rdp_disp_monitor_layout;
+
+  if (disp->Open (disp) != CHANNEL_RC_OK)
+    {
+      g_warning ("rdp: disp Open failed; resolution is fixed");
+      disp_server_context_free (disp);
+      return;
+    }
+
+  if (disp->DisplayControlCaps (disp) != CHANNEL_RC_OK)
+    {
+      g_warning ("rdp: disp DisplayControlCaps failed");
+      disp->Close (disp);
+      disp_server_context_free (disp);
+      return;
+    }
+
+  peer_ctx->disp = disp;
+  g_message ("rdp: disp channel opened (max %ux%u)",
+             DISPLAY_CONTROL_MAX_MONITOR_WIDTH,
+             DISPLAY_CONTROL_MAX_MONITOR_HEIGHT);
 }
 
 static void
@@ -2253,6 +2547,61 @@ meta_rdp_synchronize_event (rdpInput *input,
   return TRUE;
 }
 
+/* Called from FreeRDP's connection state machine when the client has sent its
+ * monitor list, before activation (libfreerdp/core/peer.c). This is where the
+ * client's real geometry shows up; FreeRDP_DesktopWidth/Height only describes
+ * the primary monitor, and a client reporting several monitors would otherwise
+ * leave us guessing. Weston's equivalent is handle_adjust_monitor_layout()
+ * in rdpdisp.c, which merges the whole list into its heads -- being
+ * single-head, we take the primary and ignore the rest.
+ *
+ * Runs on the main thread: peer PDUs are pumped from rdp_client_activity(). */
+static BOOL
+xf_peer_adjust_monitor_layout (freerdp_peer *client)
+{
+  MetaRdpPeerContext *peer_ctx = (MetaRdpPeerContext *) client->context;
+  rdpSettings *settings = client->context->settings;
+  UINT32 n_monitors = freerdp_settings_get_uint32 (settings, FreeRDP_MonitorCount);
+  const rdpMonitor *primary = NULL;
+
+  /* FreeRDP synthesises a primary from DesktopWidth/Height when the client
+   * sent no list, but only after this callback -- so an empty list here just
+   * means xf_peer_activate() will do the job instead. */
+  if (n_monitors == 0)
+    return TRUE;
+
+  for (UINT32 i = 0; i < n_monitors; i++)
+    {
+      const rdpMonitor *monitor =
+        freerdp_settings_get_pointer_array (settings, FreeRDP_MonitorDefArray, i);
+
+      if (!monitor)
+        continue;
+
+      g_message ("rdp: client monitor[%u] %dx%d+%d+%d%s",
+                 i, monitor->width, monitor->height, monitor->x, monitor->y,
+                 monitor->is_primary ? " (primary)" : "");
+
+      if (monitor->is_primary && !primary)
+        primary = monitor;
+    }
+
+  if (!primary)
+    primary = freerdp_settings_get_pointer_array (settings,
+                                                  FreeRDP_MonitorDefArray, 0);
+
+  if (primary)
+    {
+      if (n_monitors > 1)
+        g_message ("rdp: only the primary monitor is used (single-head)");
+
+      meta_rdp_server_resize_monitor (peer_ctx->server,
+                                      primary->width, primary->height, 1.0f);
+    }
+
+  return TRUE;
+}
+
 static BOOL
 xf_peer_capabilities (freerdp_peer *client)
 {
@@ -2310,9 +2659,35 @@ xf_peer_activate (freerdp_peer *client)
       return FALSE;
     }
 
+  /* The client dictates the resolution: adopt whatever it negotiated. On the
+   * first activation this replaces the --virtual-monitor size the session
+   * started at; on a re-activation after our own DesktopResize the sizes
+   * already agree and this is a no-op. */
+  meta_rdp_server_resize_monitor (peer_ctx->server,
+                                  (int) freerdp_settings_get_uint32 (settings,
+                                                                     FreeRDP_DesktopWidth),
+                                  (int) freerdp_settings_get_uint32 (settings,
+                                                                     FreeRDP_DesktopHeight),
+                                  1.0f);
+
   /* Everything past here is first-activation-only setup. */
   if (peer_ctx->activated)
-    return TRUE;
+    {
+      /* A re-activation, i.e. the client came back after a DesktopResize. Its
+       * surface was just recreated at the new size and holds nothing, so
+       * repaint all of it -- the incremental damage path would leave most of
+       * the screen blank. */
+      if (peer_ctx->resize_pending)
+        {
+          peer_ctx->resize_pending = FALSE;
+          g_message ("rdp: peer %p re-activated at %ux%u, repainting", client,
+                     freerdp_settings_get_uint32 (settings, FreeRDP_DesktopWidth),
+                     freerdp_settings_get_uint32 (settings, FreeRDP_DesktopHeight));
+          meta_rdp_peer_force_full_present (peer_ctx);
+        }
+
+      return TRUE;
+    }
 
   peer_ctx->activated = TRUE;
   g_message ("rdp: first activation complete for peer %p", client);
@@ -2348,6 +2723,10 @@ xf_peer_activate (freerdp_peer *client)
 
   /* The client has no pointer shape until we send one. */
   meta_rdp_peer_update_pointer (peer_ctx);
+
+  /* Before gfxredir: its handshake busy-pumps the peer, which flushes the
+   * caps PDU we queue here (Weston opens disp first for the same reason). */
+  meta_rdp_setup_disp (peer_ctx);
 
   meta_rdp_setup_gfxredir (peer_ctx);
 
@@ -2438,6 +2817,7 @@ rdp_peer_context_new (freerdp_peer *client, rdpContext *context)
   peer_ctx->vcm = NULL;
 
   g_mutex_init (&peer_ctx->gfxredir_mutex);
+  g_mutex_init (&peer_ctx->disp_mutex);
 
   /* Codec fallback encoder. */
   peer_ctx->nsc_context = nsc_context_new ();
@@ -2487,6 +2867,20 @@ rdp_peer_context_free (freerdp_peer *client, rdpContext *context)
   g_clear_handle_id (&peer_ctx->gfxredir_idle_id, g_source_remove);
   g_mutex_unlock (&peer_ctx->gfxredir_mutex);
   g_mutex_clear (&peer_ctx->gfxredir_mutex);
+
+  if (peer_ctx->disp)
+    {
+      /* Same ordering as gfxredir: Close() first so no layout callback can be
+       * in flight, only then drop the pending dispatch. */
+      peer_ctx->disp->Close (peer_ctx->disp);
+      disp_server_context_free (peer_ctx->disp);
+      peer_ctx->disp = NULL;
+    }
+
+  g_mutex_lock (&peer_ctx->disp_mutex);
+  g_clear_handle_id (&peer_ctx->disp_idle_id, g_source_remove);
+  g_mutex_unlock (&peer_ctx->disp_mutex);
+  g_mutex_clear (&peer_ctx->disp_mutex);
 
   g_clear_pointer (&peer_ctx->missed_damage, mtk_region_unref);
 
@@ -2638,6 +3032,7 @@ rdp_peer_init (freerdp_peer *client, MetaRdpServer *self)
   client->Capabilities = xf_peer_capabilities;
   client->PostConnect = xf_peer_post_connect;
   client->Activate = xf_peer_activate;
+  client->AdjustMonitorsLayout = xf_peer_adjust_monitor_layout;
 
   /* Task 05: route RDP keyboard/mouse into mutter's virtual input devices. */
   input = client->context->input;
