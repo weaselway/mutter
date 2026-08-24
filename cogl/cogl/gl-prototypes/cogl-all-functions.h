@@ -202,6 +202,10 @@ COGL_EXT_BEGIN (sync, 3, 2,
                 "sync\0")
 COGL_EXT_FUNCTION (GLsync, glFenceSync,
                    (GLenum condition, GLbitfield flags))
+COGL_EXT_FUNCTION (GLenum, glClientWaitSync,
+                   (GLsync sync, GLbitfield flags, GLuint64 timeout))
+COGL_EXT_FUNCTION (void, glDeleteSync,
+                   (GLsync sync))
 COGL_EXT_END ()
 #endif
 
