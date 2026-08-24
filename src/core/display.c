@@ -775,7 +775,17 @@ on_mandatory_x11_initialized (MetaDisplay  *display,
   g_autoptr (GError) error = NULL;
 
   if (!meta_display_init_x11_finish (display, result, &error))
-    g_critical ("Failed to init X11 display: %s", error->message);
+    {
+      g_critical ("Failed to init X11 display: %s", error->message);
+      return;
+    }
+
+  /* Xwayland is up and serving now, so it is finally safe to let anything in
+   * this process see a DISPLAY. meta_wayland_compositor_new() withheld it to
+   * keep a synchronous X11 connection from deadlocking the main loop that
+   * Xwayland itself needed in order to get this far. */
+  meta_wayland_publish_xwayland_display_env (
+    wayland_compositor_from_display (display));
 }
 #endif /* HAVE_XWAYLAND */
 

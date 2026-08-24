@@ -1117,8 +1117,23 @@ meta_wayland_compositor_new (MetaContext *context)
 
       status &=
         set_gnome_env ("GNOME_SETUP_DISPLAY", compositor->xwayland_manager.private_connection.name);
-      status &=
-        set_gnome_env ("DISPLAY", compositor->xwayland_manager.public_connection.name);
+
+      /* Under ON_DEMAND, DISPLAY has to be published now: mutter owns the X
+       * sockets and the whole point is that a connection to them is what
+       * triggers Xwayland. Under MANDATORY it must NOT be, or we deadlock.
+       * Anything that opens X11 synchronously on the main thread between here
+       * and Xwayland being ready blocks the main loop that Xwayland needs to
+       * finish its Wayland handshake -- gnome-shell's startup JS does exactly
+       * that via Gvc.MixerControl, whose PulseAudio config loader probes the
+       * X11 root window, and only when DISPLAY is set. Publishing it once the
+       * X11 display is actually up (see on_mandatory_x11_initialized) makes
+       * that probe a no-op instead of a race we sometimes lose. */
+      if (x11_display_policy != META_X11_DISPLAY_POLICY_MANDATORY)
+        {
+          status &=
+            set_gnome_env ("DISPLAY", compositor->xwayland_manager.public_connection.name);
+        }
+
       status &=
         set_gnome_env ("XAUTHORITY", compositor->xwayland_manager.auth_file);
 
@@ -1129,6 +1144,17 @@ meta_wayland_compositor_new (MetaContext *context)
   set_gnome_env ("WAYLAND_DISPLAY", meta_wayland_get_wayland_display_name (compositor));
 
   return compositor;
+}
+
+/* Publish DISPLAY once Xwayland can actually serve X11 clients. Only used for
+ * the MANDATORY policy, where meta_wayland_compositor_new() deliberately held
+ * it back; see the comment there. */
+void
+meta_wayland_publish_xwayland_display_env (MetaWaylandCompositor *compositor)
+{
+#ifdef HAVE_XWAYLAND
+  set_gnome_env ("DISPLAY", compositor->xwayland_manager.public_connection.name);
+#endif
 }
 
 const char *
