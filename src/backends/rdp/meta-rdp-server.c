@@ -439,6 +439,87 @@ meta_rdp_server_get_stage (MetaRdpServer *self)
   return META_STAGE (meta_backend_get_stage (self->backend));
 }
 
+/* HACK: rolling meter for the framebuffer readback, the same shape as
+ * meta_rdp_account_update() below -- exponentially weighted so it tracks
+ * recent activity, reported once a second, process-wide statics.
+ *
+ * This is the number the readback work is aimed at: glReadPixels here is a
+ * synchronous GPU->CPU transfer that on d3d12 costs a blit into a staging
+ * texture, a texture->buffer copy and a hard fence wait, all on the main loop.
+ * Tracking mean *and* peak matters -- the mean is what steady-state damage
+ * costs, the peak is what a full-frame readback (activation, resize, a
+ * fullscreen repaint) costs, and they differ by two orders of magnitude.
+ *
+ * Bytes are counted as the pixels actually requested (width * height * 4),
+ * not what the driver moved internally, so MB/s here is a lower bound. */
+static void
+meta_rdp_account_readback (int64_t elapsed_us,
+                           size_t  bytes)
+{
+  /* Weight of the newest sample in the rolling means; ~5s of history. */
+  static const double alpha = 0.2;
+  static int64_t window_start_us = 0;
+  static int64_t window_us = 0;
+  static int64_t window_peak_us = 0;
+  static size_t window_bytes = 0;
+  static unsigned window_reads = 0;
+  static double mean_us = -1.0;
+  static double mean_rps = -1.0;
+  static double mean_bps = -1.0;
+
+  int64_t now_us = g_get_monotonic_time ();
+  int64_t elapsed_window_us;
+
+  window_us += elapsed_us;
+  window_bytes += bytes;
+  window_reads++;
+  if (elapsed_us > window_peak_us)
+    window_peak_us = elapsed_us;
+
+  if (window_start_us == 0)
+    {
+      window_start_us = now_us;
+      return;
+    }
+
+  elapsed_window_us = now_us - window_start_us;
+  if (elapsed_window_us < G_USEC_PER_SEC)
+    return;
+
+  double us = (double) window_us / window_reads;
+  double rps = window_reads * (double) G_USEC_PER_SEC / elapsed_window_us;
+  double bps = window_bytes * (double) G_USEC_PER_SEC / elapsed_window_us;
+
+  if (mean_us < 0.0)
+    {
+      mean_us = us;
+      mean_rps = rps;
+      mean_bps = bps;
+    }
+  else
+    {
+      mean_us = alpha * us + (1.0 - alpha) * mean_us;
+      mean_rps = alpha * rps + (1.0 - alpha) * mean_rps;
+      mean_bps = alpha * bps + (1.0 - alpha) * mean_bps;
+    }
+
+  /* The last figure is the share of wall-clock time the main loop spent
+   * blocked in glReadPixels; at 60fps anything approaching 100% means the
+   * compositor is doing nothing but readback. */
+  g_message ("rdp: readback %.0f us/read (mean %.0f, peak %.0f), "
+             "%.1f reads/s (mean %.1f), %.2f MB/s (mean %.2f), %.1f%% of wall",
+             us, mean_us, (double) window_peak_us,
+             rps, mean_rps,
+             bps / (1024.0 * 1024.0), mean_bps / (1024.0 * 1024.0),
+             100.0 * window_us / elapsed_window_us);
+
+  window_start_us = now_us;
+  window_us = 0;
+  window_peak_us = 0;
+  window_bytes = 0;
+  window_reads = 0;
+}
+
 /* Read the @width x @height region at (@x, @y) of @framebuffer into @dest
  * (ARGB8888, i.e. BGRA byte order in memory, which is what NSCodec's
  * PIXEL_FORMAT_BGRA32, gfxredir's ARGB_8888 and an uncompressed SURFACE_BITS
@@ -464,6 +545,7 @@ meta_rdp_read_framebuffer (CoglFramebuffer *framebuffer,
 {
   CoglContext *cogl_context = cogl_framebuffer_get_context (framebuffer);
   CoglBitmap *bitmap;
+  int64_t started_us;
   gboolean ok;
 
   bitmap = cogl_bitmap_new_for_data (cogl_context,
@@ -471,10 +553,19 @@ meta_rdp_read_framebuffer (CoglFramebuffer *framebuffer,
                                      COGL_PIXEL_FORMAT_BGRA_8888_PRE,
                                      stride,
                                      dest);
+
+  /* Time only the transfer itself, not the bitmap wrapper around it. */
+  started_us = g_get_monotonic_time ();
   ok = cogl_framebuffer_read_pixels_into_bitmap (framebuffer,
                                                  x, y,
                                                  COGL_READ_PIXELS_COLOR_BUFFER,
                                                  bitmap);
+  if (ok)
+    {
+      meta_rdp_account_readback (g_get_monotonic_time () - started_us,
+                                 (size_t) width * height * 4);
+    }
+
   g_object_unref (bitmap);
 
   return ok;
