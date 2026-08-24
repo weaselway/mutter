@@ -755,9 +755,15 @@ meta_rdp_server_attach_views (MetaRdpServer *self)
       watched = g_new0 (MetaRdpWatchedView, 1);
       watched->server = self;
       watched->view = view;
+      /* AFTER_ACTOR_PAINT runs before MetaStage paints the cursor overlays, so
+       * the readback excludes the cursor sprite -- the RDP client draws its own
+       * pointer instead. This mirrors how the screen cast backend distinguishes
+       * its cursor modes (see meta_screen_cast_monitor_stream_src_sync_watches):
+       * HIDDEN/METADATA watch AFTER_ACTOR_PAINT, EMBEDDED watches AFTER_PAINT.
+       * Switch back to AFTER_PAINT to composite the cursor into the stream. */
       watched->paint_watch =
         meta_stage_watch_view (stage, view,
-                               META_STAGE_WATCH_AFTER_PAINT,
+                               META_STAGE_WATCH_AFTER_ACTOR_PAINT,
                                on_frame_ready,
                                watched);
       watched->destroy_handler_id = 1;
