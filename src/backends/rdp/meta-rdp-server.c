@@ -208,17 +208,25 @@ meta_rdp_server_get_stage (MetaRdpServer *self)
   return META_STAGE (meta_backend_get_stage (self->backend));
 }
 
-/* Read the whole framebuffer into @dest (ARGB8888, i.e. BGRA byte order in
- * memory, which is what NSCodec's PIXEL_FORMAT_BGRA32, gfxredir's ARGB_8888
- * and an uncompressed SURFACE_BITS bitmap all expect on little-endian).
+/* Read the @width x @height region at (@x, @y) of @framebuffer into @dest
+ * (ARGB8888, i.e. BGRA byte order in memory, which is what NSCodec's
+ * PIXEL_FORMAT_BGRA32, gfxredir's ARGB_8888 and an uncompressed SURFACE_BITS
+ * bitmap all expect on little-endian).
+ *
+ * Reading only the damaged region matters: this is a synchronous GPU->CPU
+ * transfer that stalls the pipeline, and a full 1920x1080 frame is ~8MB even
+ * when a single button repainted. @stride lets the caller land the region
+ * directly inside a larger destination buffer.
  *
  * The result is top-down. Cogl already accounts for the GL bottom-left origin
  * when reading into a bitmap, so no flip belongs here -- consumers that want
- * bottom-up data (the raw SURFACE_BITS path) flip as they pack their sub-rect.
+ * bottom-up data (the raw SURFACE_BITS path) flip as they pack their rows.
  * Returns FALSE on failure. */
 static gboolean
 meta_rdp_read_framebuffer (CoglFramebuffer *framebuffer,
                            uint8_t         *dest,
+                           int              x,
+                           int              y,
                            int              width,
                            int              height,
                            int              stride)
@@ -233,7 +241,7 @@ meta_rdp_read_framebuffer (CoglFramebuffer *framebuffer,
                                      stride,
                                      dest);
   ok = cogl_framebuffer_read_pixels_into_bitmap (framebuffer,
-                                                 0, 0,
+                                                 x, y,
                                                  COGL_READ_PIXELS_COLOR_BUFFER,
                                                  bitmap);
   g_object_unref (bitmap);
@@ -242,6 +250,63 @@ meta_rdp_read_framebuffer (CoglFramebuffer *framebuffer,
 }
 
 
+/* Warn when a single present blocks the main loop for longer than this. */
+#define META_RDP_SLOW_UPDATE_US (30 * 1000)
+
+/* HACK: rolling throughput meter for the raw present path. Exponentially
+ * weighted so it tracks recent activity rather than the whole session average,
+ * and reported once a second. Process-wide statics -- with one client that is
+ * all we need, and this is a tuning aid, not instrumentation worth keeping. */
+static void
+meta_rdp_account_update (size_t bytes)
+{
+  /* Weight of the newest sample in the rolling means; ~5s of history. */
+  static const double alpha = 0.2;
+  static int64_t window_start_us = 0;
+  static size_t window_bytes = 0;
+  static unsigned window_updates = 0;
+  static double mean_bps = -1.0;
+  static double mean_ups = -1.0;
+
+  int64_t now_us = g_get_monotonic_time ();
+  int64_t elapsed_us;
+
+  window_bytes += bytes;
+  window_updates++;
+
+  if (window_start_us == 0)
+    {
+      window_start_us = now_us;
+      return;
+    }
+
+  elapsed_us = now_us - window_start_us;
+  if (elapsed_us < G_USEC_PER_SEC)
+    return;
+
+  double bps = window_bytes * (double) G_USEC_PER_SEC / elapsed_us;
+  double ups = window_updates * (double) G_USEC_PER_SEC / elapsed_us;
+
+  if (mean_bps < 0.0)
+    {
+      mean_bps = bps;
+      mean_ups = ups;
+    }
+  else
+    {
+      mean_bps = alpha * bps + (1.0 - alpha) * mean_bps;
+      mean_ups = alpha * ups + (1.0 - alpha) * mean_ups;
+    }
+
+  g_message ("rdp: %.1f updates/s (mean %.1f), %.2f MB/s (mean %.2f)",
+             ups, mean_ups,
+             bps / (1024.0 * 1024.0), mean_bps / (1024.0 * 1024.0));
+
+  window_start_us = now_us;
+  window_bytes = 0;
+  window_updates = 0;
+}
+
 static void
 meta_rdp_present_codec (MetaRdpPeerContext *peer_ctx,
                         CoglFramebuffer    *framebuffer,
@@ -249,13 +314,12 @@ meta_rdp_present_codec (MetaRdpPeerContext *peer_ctx,
 {
   freerdp_peer *client = peer_ctx->peer;
   rdpUpdate *update = client->context->update;
-  rdpSettings *settings = client->context->settings;
   int width = cogl_framebuffer_get_width (framebuffer);
   int height = cogl_framebuffer_get_height (framebuffer);
-  int stride = width * 4;
   g_autofree uint8_t *pixels = NULL;
   SURFACE_BITS_COMMAND cmd = { 0 };
   MtkRectangle rect;
+  int sub_stride;
 
   /* Clip damage to the framebuffer bounds. */
   rect = *damage;
@@ -269,16 +333,20 @@ meta_rdp_present_codec (MetaRdpPeerContext *peer_ctx,
   if (rect.width <= 0 || rect.height <= 0)
     return;
 
-  g_message ("rdp: present_codec enter rect=%d,%d %dx%d", rect.x, rect.y, rect.width, rect.height);
+  g_debug ("rdp: present_codec enter rect=%d,%d %dx%d", rect.x, rect.y, rect.width, rect.height);
 
-  pixels = g_malloc ((size_t) stride * height);
-  if (!meta_rdp_read_framebuffer (framebuffer, pixels, width, height, stride))
+  /* Read back only the damage rect, tightly packed. */
+  sub_stride = rect.width * 4;
+  pixels = g_malloc ((size_t) sub_stride * rect.height);
+  if (!meta_rdp_read_framebuffer (framebuffer, pixels,
+                                  rect.x, rect.y,
+                                  rect.width, rect.height, sub_stride))
     {
       g_warning ("rdp: framebuffer readback failed (codec path)");
       return;
     }
 
-  g_message ("rdp: present_codec readback done");
+  g_debug ("rdp: present_codec readback done");
 
   cmd.cmdType = CMDTYPE_SET_SURFACE_BITS;
   cmd.destLeft = rect.x;
@@ -289,57 +357,47 @@ meta_rdp_present_codec (MetaRdpPeerContext *peer_ctx,
   cmd.bmp.width = rect.width;
   cmd.bmp.height = rect.height;
 
-  if (freerdp_settings_get_bool (settings, FreeRDP_NSCodec) &&
-      peer_ctx->nsc_context && peer_ctx->encode_stream)
-    {
-      const uint8_t *ptr = pixels + (size_t) rect.y * stride + rect.x * 4;
+  /* Raw: copy the damage sub-rect tightly, flipping it bottom-up. An
+   * uncompressed SURFACE_BITS bitmap is stored bottom-up, the usual Windows
+   * DIB convention, while the readback above is top-down. */
+  {
+    g_autofree uint8_t *sub = NULL;
+    int y;
 
-      Stream_Clear (peer_ctx->encode_stream);
-      Stream_SetPosition (peer_ctx->encode_stream, 0);
+    sub = g_malloc ((size_t) sub_stride * rect.height);
+    for (y = 0; y < rect.height; y++)
+      {
+        memcpy (sub + (size_t) y * sub_stride,
+                pixels + (size_t) (rect.height - 1 - y) * sub_stride,
+                (size_t) sub_stride);
+      }
 
-      nsc_compose_message (peer_ctx->nsc_context, peer_ctx->encode_stream,
-                           (BYTE *) ptr, rect.width, rect.height, stride);
+    cmd.bmp.codecID = 0;
+    cmd.bmp.bitmapDataLength = sub_stride * rect.height;
+    cmd.bmp.bitmapData = sub;
+    g_debug ("rdp: present_codec calling SurfaceBits (raw, %u bytes)",
+             cmd.bmp.bitmapDataLength);
 
-      cmd.skipCompression = TRUE;
-      cmd.bmp.codecID = freerdp_settings_get_uint32 (settings, FreeRDP_NSCodecId);
-      cmd.bmp.bitmapDataLength = Stream_GetPosition (peer_ctx->encode_stream);
-      cmd.bmp.bitmapData = Stream_Buffer (peer_ctx->encode_stream);
+    /* SurfaceBits runs on the main loop, so however long it blocks is time the
+     * compositor is not painting or servicing input. */
+    int64_t started_us = g_get_monotonic_time ();
+    update->SurfaceBits (update->context, &cmd);
+    int64_t elapsed_us = g_get_monotonic_time () - started_us;
 
-      g_message ("rdp: present_codec calling SurfaceBits (nsc, %u bytes)",
-                 cmd.bmp.bitmapDataLength);
-      update->SurfaceBits (update->context, &cmd);
-      g_message ("rdp: present_codec SurfaceBits returned (nsc)");
-    }
-  else
-    {
-      /* Raw: copy the damage sub-rect tightly, flipping it bottom-up.
-       *
-       * An uncompressed SURFACE_BITS bitmap is stored bottom-up, the usual
-       * Windows DIB convention, while the readback above is top-down. The
-       * NSCodec branch needs no flip because nsc_compose_message() already
-       * emits rows in the order the wire expects. */
-      g_autofree uint8_t *sub = NULL;
-      int y;
+    if (elapsed_us > META_RDP_SLOW_UPDATE_US)
+      {
+        g_warning ("rdp: SurfaceBits blocked %.1f ms for %u bytes "
+                   "(%dx%d at %d,%d)",
+                   elapsed_us / 1000.0, cmd.bmp.bitmapDataLength,
+                   rect.width, rect.height, rect.x, rect.y);
+      }
 
-      sub = g_malloc ((size_t) rect.width * rect.height * 4);
-      for (y = 0; y < rect.height; y++)
-        {
-          memcpy (sub + (size_t) y * rect.width * 4,
-                  pixels + (size_t) (rect.y + rect.height - 1 - y) * stride +
-                  rect.x * 4,
-                  (size_t) rect.width * 4);
-        }
+    g_debug ("rdp: present_codec SurfaceBits returned (raw)");
 
-      cmd.bmp.codecID = 0;
-      cmd.bmp.bitmapDataLength = rect.width * rect.height * 4;
-      cmd.bmp.bitmapData = sub;
-      g_message ("rdp: present_codec calling SurfaceBits (raw, %u bytes)",
-                 cmd.bmp.bitmapDataLength);
-      update->SurfaceBits (update->context, &cmd);
-      g_message ("rdp: present_codec SurfaceBits returned (raw)");
-    }
+    meta_rdp_account_update (cmd.bmp.bitmapDataLength);
+  }
 
-  g_message ("rdp: present_codec exit");
+  g_debug ("rdp: present_codec exit");
 }
 
 static void
@@ -540,15 +598,6 @@ meta_rdp_present_gfxredir (MetaRdpPeerContext *peer_ctx,
   if (!meta_rdp_ensure_buffer (peer_ctx, width, height))
     return;
 
-  /* Read the whole composited frame into the shared buffer. Damage-clipping
-   * the read_pixels is a task-07 optimization; for correctness we read all. */
-  if (!meta_rdp_read_framebuffer (framebuffer, peer_ctx->shm_addr,
-                                  width, height, peer_ctx->buffer_stride))
-    {
-      g_warning ("rdp: framebuffer readback failed (gfxredir path)");
-      return;
-    }
-
   /* Clip damage to bounds. */
   rect = *damage;
   if (rect.x < 0) { rect.width += rect.x; rect.x = 0; }
@@ -563,6 +612,23 @@ meta_rdp_present_gfxredir (MetaRdpPeerContext *peer_ctx,
       rect.y = 0;
       rect.width = width;
       rect.height = height;
+    }
+
+  /* Read just the damaged region straight into its place in the shared buffer.
+   * The rest of the buffer still holds the previous frame, which is exactly
+   * what the client expects: it composites the presented rect over what it
+   * already has. Passing the full buffer_stride is what lets a narrow region
+   * land at the right offset on every row. */
+  if (!meta_rdp_read_framebuffer (framebuffer,
+                                  (uint8_t *) peer_ctx->shm_addr +
+                                  (size_t) rect.y * peer_ctx->buffer_stride +
+                                  (size_t) rect.x * 4,
+                                  rect.x, rect.y,
+                                  rect.width, rect.height,
+                                  peer_ctx->buffer_stride))
+    {
+      g_warning ("rdp: framebuffer readback failed (gfxredir path)");
+      return;
     }
 
   opaque_rect.left = rect.x;
@@ -949,7 +1015,7 @@ meta_rdp_fd_source_dispatch (GSource     *source,
 
   revents = g_source_query_unix_fd (source, fd_source->fd_tag);
 
-    g_message ("rdp: fd source %s (fd %d) dispatch #%" G_GUINT64_FORMAT
+    g_debug ("rdp: fd source %s (fd %d) dispatch #%" G_GUINT64_FORMAT
                 " revents=0x%x",
                 fd_source->label, fd_source->fd,
                 fd_source->dispatch_count, (unsigned int) revents);
