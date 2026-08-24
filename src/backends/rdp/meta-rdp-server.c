@@ -19,6 +19,7 @@
 #include "config.h"
 
 #include "backends/rdp/meta-rdp-server.h"
+#include "backends/rdp/meta-rdp-clipboard.h"
 
 #include "backends/meta-backend-private.h"
 #include "backends/meta-renderer.h"
@@ -103,6 +104,9 @@ typedef struct _MetaRdpPeerContext
   /* Task 05: input injection via clutter virtual devices. */
   ClutterVirtualInputDevice *virtual_pointer;
   ClutterVirtualInputDevice *virtual_keyboard;
+
+  /* CLIPRDR clipboard bridge, created on first activation. */
+  MetaRdpClipboard *clipboard;
 
   /* Debounced pointer button state, indexed by (button - BTN_LEFT). */
   gboolean button_state[8];
@@ -1514,6 +1518,8 @@ xf_peer_post_connect (freerdp_peer *client)
   return TRUE;
 }
 
+static gboolean rdp_client_activity (gpointer data);
+
 static BOOL
 xf_peer_activate (freerdp_peer *client)
 {
@@ -1551,6 +1557,27 @@ xf_peer_activate (freerdp_peer *client)
   /* Sync the xkb layout to the client's reported RDP keyboard layout. */
   meta_rdp_apply_keymap (peer_ctx->server, settings);
 
+  /* Bridge the clipboard (CLIPRDR is a static channel; no drdynvc needed). */
+  if (peer_ctx->vcm && !peer_ctx->clipboard)
+    {
+      peer_ctx->clipboard = meta_rdp_clipboard_new (client,
+                                                    peer_ctx->server->backend,
+                                                    peer_ctx->vcm);
+
+      if (peer_ctx->clipboard)
+        {
+          HANDLE h = meta_rdp_clipboard_get_event_handle (peer_ctx->clipboard);
+          int fd = h ? GetEventFileDescriptor (h) : -1;
+
+          if (fd >= 0 &&
+              peer_ctx->n_fd_sources < META_RDP_MAX_FREERDP_FDS)
+            {
+              peer_ctx->fd_sources[peer_ctx->n_fd_sources++] =
+                meta_rdp_add_fd_source (fd, rdp_client_activity, client);
+            }
+        }
+    }
+
 #ifdef HAVE_FREERDP_GFXREDIR_H
   meta_rdp_setup_gfxredir (peer_ctx);
   if (peer_ctx->use_gfxredir)
@@ -1584,6 +1611,16 @@ rdp_client_activity (gpointer data)
       if (!WTSVirtualChannelManagerCheckFileDescriptor (peer_ctx->vcm))
         {
           g_message ("rdp: WTS VC CheckFileDescriptor failed for peer %p",
+                     client);
+          goto out_clean;
+        }
+    }
+
+  if (peer_ctx->clipboard)
+    {
+      if (!meta_rdp_clipboard_check_event_handle (peer_ctx->clipboard))
+        {
+          g_message ("rdp: clipboard CheckEventHandle failed for peer %p",
                      client);
           goto out_clean;
         }
@@ -1633,6 +1670,8 @@ rdp_peer_context_free (freerdp_peer *client, rdpContext *context)
 
   g_clear_object (&peer_ctx->virtual_pointer);
   g_clear_object (&peer_ctx->virtual_keyboard);
+
+  g_clear_pointer (&peer_ctx->clipboard, meta_rdp_clipboard_free);
 
 #ifdef HAVE_FREERDP_GFXREDIR_H
   meta_rdp_destroy_buffer (peer_ctx);
@@ -1722,6 +1761,8 @@ rdp_peer_init (freerdp_peer *client, MetaRdpServer *self)
   settings->SupportMonitorLayoutPdu = TRUE;
   settings->HasExtendedMouseEvent = TRUE;
   settings->HasHorizontalWheel = TRUE;
+  /* Enable CLIPRDR so the client negotiates the clipboard channel. */
+  settings->RedirectClipboard = TRUE;
 
   client->Capabilities = xf_peer_capabilities;
   client->PostConnect = xf_peer_post_connect;
