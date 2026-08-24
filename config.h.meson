@@ -58,6 +58,12 @@
 /* Defined if screen cast and remote desktop support is enabled */
 #mesondefine HAVE_REMOTE_DESKTOP
 
+/* Defined if the in-process RDP/VAIL output backend is enabled */
+#mesondefine HAVE_RDP
+
+/* Defined if FreeRDP provides the gfxredir server header (VAIL fast path) */
+#mesondefine HAVE_FREERDP_GFXREDIR_H
+
 /* Defined if the devkit is enabled */
 #mesondefine HAVE_DEVKIT
 

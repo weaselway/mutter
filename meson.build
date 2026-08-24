@@ -313,6 +313,21 @@ if have_remote_desktop
   libpipewire_dep = dependency('libpipewire-0.3', version: libpipewire_req)
 endif
 
+# In-process RDP/VAIL output backend (WSLg).
+have_rdp = get_option('rdp').enabled()
+have_gfxredir = false
+if have_rdp
+  freerdp_req = '>= 3.0.0'
+  freerdp_dep = dependency('freerdp3', version: freerdp_req, required: get_option('rdp'))
+  freerdp_server_dep = dependency('freerdp-server3', version: freerdp_req, required: get_option('rdp'))
+  winpr_dep = dependency('winpr3', version: freerdp_req, required: get_option('rdp'))
+  rdp_deps = [freerdp_dep, freerdp_server_dep, winpr_dep]
+  # Weston's gfxredir/VAIL fast path needs the microsoft/FreeRDP-mirror header
+  # freerdp/server/gfxredir.h, which stock FreeRDP does not ship.
+  have_gfxredir = cc.has_header('freerdp/server/gfxredir.h',
+    dependencies: freerdp_server_dep)
+endif
+
 have_devkit = get_option('devkit').enable_auto_if(
   gtk4_dep.found() and
   libadwaita_dep.found() and
@@ -561,6 +576,8 @@ cdata.set('HAVE_XWAYLAND', have_xwayland)
 cdata.set('HAVE_LOGIND', have_logind)
 cdata.set('HAVE_NATIVE_BACKEND', have_native_backend)
 cdata.set('HAVE_REMOTE_DESKTOP', have_remote_desktop)
+cdata.set('HAVE_RDP', have_rdp)
+cdata.set('HAVE_FREERDP_GFXREDIR_H', have_gfxredir)
 cdata.set('HAVE_DEVKIT', have_devkit)
 cdata.set('HAVE_GNOME_DESKTOP', have_gnome_desktop)
 cdata.set('HAVE_SOUND_PLAYER', have_sound_player)
@@ -751,6 +768,8 @@ summary('XWayland', have_xwayland, section: 'Options')
 summary('Native Backend', have_native_backend, section: 'Options')
 summary('EGL Device', have_egl_device, section: 'Options')
 summary('Remote desktop', have_remote_desktop, section: 'Options')
+summary('RDP/VAIL backend', have_rdp, section: 'Options')
+summary('gfxredir (VAIL fast path)', have_gfxredir, section: 'Options')
 summary('Development Kit', have_devkit, section: 'Options')
 summary('libgnome-desktop', have_gnome_desktop, section: 'Options')
 summary('Sound player', have_sound_player, section: 'Options')
