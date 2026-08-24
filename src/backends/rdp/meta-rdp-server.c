@@ -26,6 +26,8 @@
 #include "backends/meta-stage-private.h"
 #include "clutter/clutter.h"
 #include "cogl/cogl.h"
+#include "meta/meta-backend.h"
+#include "meta/meta-keymap-description.h"
 #include "core/meta-context-private.h"
 #include "meta/meta-backend.h"
 #include "meta/meta-context.h"
@@ -39,6 +41,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <linux/vm_sockets.h>
+#include <linux/input.h>
 
 #include <freerdp/freerdp.h>
 #include <freerdp/codec/nsc.h>
@@ -46,7 +49,10 @@
 #include <freerdp/listener.h>
 #include <freerdp/peer.h>
 #include <freerdp/version.h>
+#include <freerdp/input.h>
+#include <freerdp/locale/keyboard.h>
 #include <freerdp/channels/wtsvc.h>
+#include <winpr/input.h>
 #include <freerdp/channels/channels.h>
 #include <winpr/synch.h>
 #include <winpr/wtsapi.h>
@@ -93,6 +99,20 @@ typedef struct _MetaRdpPeerContext
   int n_fd_sources;
 
   gboolean activated;
+
+  /* Task 05: input injection via clutter virtual devices. */
+  ClutterVirtualInputDevice *virtual_pointer;
+  ClutterVirtualInputDevice *virtual_keyboard;
+
+  /* Debounced pointer button state, indexed by (button - BTN_LEFT). */
+  gboolean button_state[8];
+  gboolean mouse_button_swap;
+
+  /* Precise/discrete wheel accumulation (ported from Weston). */
+  int vertical_accum_wheel_precise;
+  int vertical_accum_wheel_discrete;
+  int horizontal_accum_wheel_precise;
+  int horizontal_accum_wheel_discrete;
 
   /* Fallback (codec) present path: NSCodec / raw over the wire. */
   NSC_CONTEXT *nsc_context;
@@ -975,6 +995,513 @@ meta_rdp_setup_gfxredir (MetaRdpPeerContext *peer_ctx)
 }
 #endif /* HAVE_FREERDP_GFXREDIR_H */
 
+/* ------------------------------------------------------------------ */
+/* Task 05: input injection (RDP keyboard/mouse -> clutter virtual devices) */
+/* ------------------------------------------------------------------ */
+
+/* Locally define missing keyboard layout IDs in FreeRDP 2.x, as Weston does. */
+#ifndef KBD_HEBREW_STANDARD
+#define KBD_HEBREW_STANDARD 0x2040d
+#endif
+#ifndef KBD_PERSIAN
+#define KBD_PERSIAN 0x50429
+#endif
+#ifndef KBD_FRENCH_STANDARD_BEPO
+#define KBD_FRENCH_STANDARD_BEPO 0x2040c
+#endif
+#ifndef KBD_FRENCH_STANDARD_AZERTY
+#define KBD_FRENCH_STANDARD_AZERTY 0x1040c
+#endif
+
+struct rdp_to_xkb_keyboard_layout
+{
+  UINT32 rdpLayoutCode;
+  const char *xkbLayout;
+  const char *xkbVariant;
+};
+
+/* Reversed from FreeRDP's xkb_layout_ids.c; ported verbatim from Weston's
+ * rdp.c rdp_keyboards[]. */
+static const struct rdp_to_xkb_keyboard_layout rdp_keyboards[] = {
+  { KBD_ARABIC_101, "ara", 0 },
+  { KBD_BULGARIAN, 0, 0 },
+  { KBD_CHINESE_TRADITIONAL_US, 0, 0 },
+  { KBD_CZECH, "cz", 0 },
+  { KBD_CZECH_PROGRAMMERS, "cz", "bksl" },
+  { KBD_CZECH_QWERTY, "cz", "qwerty" },
+  { KBD_DANISH, "dk", 0 },
+  { KBD_GERMAN, "de", 0 },
+  { KBD_GERMAN_NEO, "de", "neo" },
+  { KBD_GERMAN_IBM, "de", "qwerty" },
+  { KBD_GREEK, "gr", 0 },
+  { KBD_GREEK_220, "gr", "simple" },
+  { KBD_GREEK_319, "gr", "extended" },
+  { KBD_GREEK_POLYTONIC, "gr", "polytonic" },
+  { KBD_US, "us", 0 },
+  { KBD_UNITED_STATES_INTERNATIONAL, "us", "intl" },
+  { KBD_US_ENGLISH_TABLE_FOR_IBM_ARABIC_238_L, "ara", "buckwalter" },
+  { KBD_SPANISH, "es", 0 },
+  { KBD_SPANISH_VARIATION, "es", "nodeadkeys" },
+  { KBD_FINNISH, "fi", 0 },
+  { KBD_FRENCH, "fr", 0 },
+  { KBD_FRENCH_STANDARD_BEPO, "fr", "bepo" },
+  { KBD_FRENCH_STANDARD_AZERTY, "fr", "afnor" },
+  { KBD_HEBREW, "il", 0 },
+  { KBD_HEBREW_STANDARD, "il", "basic" },
+  { KBD_HUNGARIAN, "hu", 0 },
+  { KBD_HUNGARIAN_101_KEY, "hu", "standard" },
+  { KBD_ICELANDIC, "is", 0 },
+  { KBD_ITALIAN, "it", 0 },
+  { KBD_ITALIAN_142, "it", "nodeadkeys" },
+  { KBD_JAPANESE, "jp", 0 },
+  { KBD_JAPANESE_INPUT_SYSTEM_MS_IME2002, "jp", 0 },
+  { KBD_KOREAN, "kr", 0 },
+  { KBD_KOREAN_INPUT_SYSTEM_IME_2000, "kr", "kr104" },
+  { KBD_DUTCH, "nl", 0 },
+  { KBD_NORWEGIAN, "no", 0 },
+  { KBD_POLISH_PROGRAMMERS, "pl", 0 },
+  { KBD_POLISH_214, "pl", "qwertz" },
+  { KBD_ROMANIAN, "ro", 0 },
+  { KBD_RUSSIAN, "ru", 0 },
+  { KBD_RUSSIAN_TYPEWRITER, "ru", "typewriter" },
+  { KBD_CROATIAN, "hr", 0 },
+  { KBD_SLOVAK, "sk", 0 },
+  { KBD_SLOVAK_QWERTY, "sk", "qwerty" },
+  { KBD_ALBANIAN, 0, 0 },
+  { KBD_SWEDISH, "se", 0 },
+  { KBD_THAI_KEDMANEE, "th", 0 },
+  { KBD_THAI_KEDMANEE_NON_SHIFTLOCK, "th", "tis" },
+  { KBD_TURKISH_Q, "tr", 0 },
+  { KBD_TURKISH_F, "tr", "f" },
+  { KBD_URDU, "in", "urd-phonetic3" },
+  { KBD_UKRAINIAN, "ua", 0 },
+  { KBD_BELARUSIAN, "by", 0 },
+  { KBD_SLOVENIAN, "si", 0 },
+  { KBD_ESTONIAN, "ee", 0 },
+  { KBD_LATVIAN, "lv", 0 },
+  { KBD_LITHUANIAN, "lt", 0 },
+  { KBD_LITHUANIAN_IBM, "lt", "ibm" },
+  { KBD_FARSI, "ir", "pes" },
+  { KBD_PERSIAN, "af", "basic" },
+  { KBD_VIETNAMESE, "vn", 0 },
+  { KBD_ARMENIAN_EASTERN, "am", 0 },
+  { KBD_AZERI_LATIN, 0, 0 },
+  { KBD_FYRO_MACEDONIAN, "mk", 0 },
+  { KBD_GEORGIAN, "ge", 0 },
+  { KBD_FAEROESE, 0, 0 },
+  { KBD_DEVANAGARI_INSCRIPT, 0, 0 },
+  { KBD_MALTESE_47_KEY, 0, 0 },
+  { KBD_NORWEGIAN_WITH_SAMI, "no", "smi" },
+  { KBD_KAZAKH, "kz", 0 },
+  { KBD_KYRGYZ_CYRILLIC, "kg", "phonetic" },
+  { KBD_TATAR, "ru", "tt" },
+  { KBD_BENGALI, "bd", 0 },
+  { KBD_BENGALI_INSCRIPT, "bd", "probhat" },
+  { KBD_PUNJABI, 0, 0 },
+  { KBD_GUJARATI, "in", "guj" },
+  { KBD_TAMIL, "in", "tam" },
+  { KBD_TELUGU, "in", "tel" },
+  { KBD_KANNADA, "in", "kan" },
+  { KBD_MALAYALAM, "in", "mal" },
+  { KBD_HINDI_TRADITIONAL, "in", 0 },
+  { KBD_MARATHI, 0, 0 },
+  { KBD_MONGOLIAN_CYRILLIC, "mn", 0 },
+  { KBD_UNITED_KINGDOM_EXTENDED, "gb", "intl" },
+  { KBD_SYRIAC, "syc", 0 },
+  { KBD_SYRIAC_PHONETIC, "syc", "syc_phonetic" },
+  { KBD_NEPALI, "np", 0 },
+  { KBD_PASHTO, "af", "ps" },
+  { KBD_DIVEHI_PHONETIC, 0, 0 },
+  { KBD_LUXEMBOURGISH, 0, 0 },
+  { KBD_MAORI, "mao", 0 },
+  { KBD_CHINESE_SIMPLIFIED_US, 0, 0 },
+  { KBD_SWISS_GERMAN, "ch", "de_nodeadkeys" },
+  { KBD_UNITED_KINGDOM, "gb", 0 },
+  { KBD_LATIN_AMERICAN, "latam", 0 },
+  { KBD_BELGIAN_FRENCH, "be", 0 },
+  { KBD_BELGIAN_PERIOD, "be", "oss_sundeadkeys" },
+  { KBD_PORTUGUESE, "pt", 0 },
+  { KBD_SERBIAN_LATIN, "rs", 0 },
+  { KBD_AZERI_CYRILLIC, "az", "cyrillic" },
+  { KBD_SWEDISH_WITH_SAMI, "se", "smi" },
+  { KBD_UZBEK_CYRILLIC, "af", "uz" },
+  { KBD_INUKTITUT_LATIN, "ca", "ike" },
+  { KBD_CANADIAN_FRENCH_LEGACY, "ca", "fr-legacy" },
+  { KBD_SERBIAN_CYRILLIC, "rs", 0 },
+  { KBD_CANADIAN_FRENCH, "ca", 0 },
+  { KBD_SWISS_FRENCH, "ch", "fr" },
+  { KBD_BOSNIAN, "ba", 0 },
+  { KBD_IRISH, 0, 0 },
+  { KBD_BOSNIAN_CYRILLIC, "ba", "us" },
+  { KBD_UNITED_STATES_DVORAK, "us", "dvorak" },
+  { KBD_PORTUGUESE_BRAZILIAN_ABNT2, "br", "abnt2" },
+  { KBD_CANADIAN_MULTILINGUAL_STANDARD, "ca", "multix" },
+  { KBD_GAELIC, "ie", "CloGaelach" },
+  { 0x00000000, 0, 0 },
+};
+
+static void
+meta_rdp_apply_keymap (MetaRdpServer *self,
+                       rdpSettings   *settings)
+{
+  const char *layout = NULL;
+  const char *variant = NULL;
+  g_autoptr (MetaKeymapDescription) description = NULL;
+  int i;
+
+  for (i = 0; rdp_keyboards[i].rdpLayoutCode; i++)
+    {
+      if (rdp_keyboards[i].rdpLayoutCode == settings->KeyboardLayout)
+        {
+          layout = rdp_keyboards[i].xkbLayout;
+          variant = rdp_keyboards[i].xkbVariant;
+          break;
+        }
+    }
+
+  /* Korean keyboard support (KeyboardType 8, LangID 0x412). */
+  if (settings->KeyboardType == 8 &&
+      (settings->KeyboardLayout & 0xFFFF) == 0x412)
+    {
+      if (settings->KeyboardSubType == 0 || settings->KeyboardSubType == 3)
+        variant = "kr104";
+      else if (settings->KeyboardSubType == 6)
+        variant = "kr106";
+    }
+  /* Japanese layout with non-Japanese keyboard falls back to "us". */
+  else if (settings->KeyboardType != 7 &&
+           (settings->KeyboardLayout & 0xFFFF) == 0x411)
+    {
+      layout = "us";
+      variant = NULL;
+    }
+
+  if (!layout)
+    {
+      g_message ("rdp: no xkb layout for RDP layout 0x%x; keeping default",
+                 settings->KeyboardLayout);
+      return;
+    }
+
+  g_message ("rdp: keyboard layout 0x%x -> xkb model=pc105 layout=%s variant=%s",
+             settings->KeyboardLayout, layout, variant ? variant : "(none)");
+
+  description = meta_keymap_description_new_from_rules ("pc105", layout, variant,
+                                                       NULL, NULL, NULL);
+  if (!description)
+    return;
+
+  meta_backend_set_keymap_async (self->backend, description, 0, NULL,
+                                 NULL, NULL);
+}
+
+static void
+meta_rdp_ensure_virtual_pointer (MetaRdpPeerContext *peer_ctx)
+{
+  MetaBackend *backend = peer_ctx->server->backend;
+  ClutterBackend *clutter_backend = meta_backend_get_clutter_backend (backend);
+  ClutterSeat *seat = clutter_backend_get_default_seat (clutter_backend);
+
+  if (!peer_ctx->virtual_pointer)
+    {
+      peer_ctx->virtual_pointer =
+        clutter_seat_create_virtual_device (seat, CLUTTER_POINTER_DEVICE);
+    }
+}
+
+static void
+meta_rdp_ensure_virtual_keyboard (MetaRdpPeerContext *peer_ctx)
+{
+  MetaBackend *backend = peer_ctx->server->backend;
+  ClutterBackend *clutter_backend = meta_backend_get_clutter_backend (backend);
+  ClutterSeat *seat = clutter_backend_get_default_seat (clutter_backend);
+
+  if (!peer_ctx->virtual_keyboard)
+    {
+      peer_ctx->virtual_keyboard =
+        clutter_seat_create_virtual_device (seat, CLUTTER_KEYBOARD_DEVICE);
+    }
+}
+
+/* Absolute pointer motion. On our single fullscreen output the RDP client
+ * coordinates map 1:1 into stage coordinates (scale 1.0), so this collapses to
+ * identity (Weston's to_weston_coordinate() does the same for one output). */
+static void
+meta_rdp_notify_pointer_position (MetaRdpPeerContext *peer_ctx,
+                                  UINT16              x,
+                                  UINT16              y)
+{
+  meta_rdp_ensure_virtual_pointer (peer_ctx);
+  clutter_virtual_input_device_notify_absolute_motion (peer_ctx->virtual_pointer,
+                                                       CLUTTER_CURRENT_TIME,
+                                                       (double) x, (double) y);
+}
+
+/* Debounce redundant button state, matching Weston's rdp_validate_button_state.
+ * Returns TRUE if the (evdev) button should be injected. */
+static gboolean
+meta_rdp_validate_button_state (MetaRdpPeerContext *peer_ctx,
+                                gboolean            pressed,
+                                uint32_t            button)
+{
+  uint32_t index = button - BTN_LEFT;
+
+  if (index >= G_N_ELEMENTS (peer_ctx->button_state))
+    return FALSE;
+
+  if (pressed == peer_ctx->button_state[index])
+    return FALSE;
+
+  peer_ctx->button_state[index] = pressed;
+  return TRUE;
+}
+
+static void
+meta_rdp_notify_button (MetaRdpPeerContext *peer_ctx,
+                        uint32_t            evdev_button,
+                        gboolean            pressed)
+{
+  if (!meta_rdp_validate_button_state (peer_ctx, pressed, evdev_button))
+    return;
+
+  meta_rdp_ensure_virtual_pointer (peer_ctx);
+  clutter_virtual_input_device_notify_button (peer_ctx->virtual_pointer,
+                                              CLUTTER_CURRENT_TIME,
+                                              meta_evdev_button_to_clutter (evdev_button),
+                                              pressed ? CLUTTER_BUTTON_STATE_PRESSED
+                                                      : CLUTTER_BUTTON_STATE_RELEASED);
+}
+
+/* Precise/discrete wheel accumulation ported from Weston's
+ * rdp_notify_wheel_scroll. */
+static void
+meta_rdp_notify_wheel_scroll (MetaRdpPeerContext    *peer_ctx,
+                              UINT16                 flags,
+                              gboolean               horizontal)
+{
+  int ivalue;
+  int *accum_precise;
+  int *accum_discrete;
+  ClutterScrollDirection direction;
+
+  ivalue = (int) (flags & 0x000000ff);
+  if (flags & PTR_FLAGS_WHEEL_NEGATIVE)
+    ivalue = (0xff - ivalue) * -1;
+
+  if (!horizontal)
+    {
+      /* RDP vertical direction is inverse of Wayland. */
+      ivalue *= -1;
+      accum_precise = &peer_ctx->vertical_accum_wheel_precise;
+      accum_discrete = &peer_ctx->vertical_accum_wheel_discrete;
+    }
+  else
+    {
+      accum_precise = &peer_ctx->horizontal_accum_wheel_precise;
+      accum_discrete = &peer_ctx->horizontal_accum_wheel_discrete;
+    }
+
+  *accum_precise += ivalue;
+  *accum_discrete += ivalue;
+
+  if (abs (*accum_precise) >= 12)
+    {
+      int steps = *accum_discrete / 120;
+      int n;
+
+      if (steps == 0)
+        steps = (*accum_precise > 0) ? 1 : -1;
+
+      meta_rdp_ensure_virtual_pointer (peer_ctx);
+
+      if (!horizontal)
+        direction = (steps < 0) ? CLUTTER_SCROLL_UP : CLUTTER_SCROLL_DOWN;
+      else
+        direction = (steps < 0) ? CLUTTER_SCROLL_LEFT : CLUTTER_SCROLL_RIGHT;
+
+      for (n = 0; n < abs (steps); n++)
+        {
+          clutter_virtual_input_device_notify_discrete_scroll (peer_ctx->virtual_pointer,
+                                                               CLUTTER_CURRENT_TIME,
+                                                               direction,
+                                                               CLUTTER_SCROLL_SOURCE_WHEEL);
+        }
+
+      *accum_precise %= 12;
+      *accum_discrete %= 120;
+    }
+}
+
+static BOOL
+meta_rdp_mouse_event (rdpInput *input,
+                      UINT16    flags,
+                      UINT16    x,
+                      UINT16    y)
+{
+  MetaRdpPeerContext *peer_ctx = (MetaRdpPeerContext *) input->context;
+  uint32_t button = 0;
+
+  if (!peer_ctx->activated)
+    return TRUE;
+
+  if (!(flags & (PTR_FLAGS_WHEEL | PTR_FLAGS_HWHEEL)))
+    meta_rdp_notify_pointer_position (peer_ctx, x, y);
+
+  if (flags & PTR_FLAGS_BUTTON1)
+    button = peer_ctx->mouse_button_swap ? BTN_RIGHT : BTN_LEFT;
+  else if (flags & PTR_FLAGS_BUTTON2)
+    button = peer_ctx->mouse_button_swap ? BTN_LEFT : BTN_RIGHT;
+  else if (flags & PTR_FLAGS_BUTTON3)
+    button = BTN_MIDDLE;
+
+  if (button)
+    meta_rdp_notify_button (peer_ctx, button, (flags & PTR_FLAGS_DOWN) ? TRUE : FALSE);
+
+  /* Per RDP spec, if both WHEEL and HWHEEL are set, WHEEL takes precedence. */
+  if (flags & PTR_FLAGS_WHEEL)
+    meta_rdp_notify_wheel_scroll (peer_ctx, flags, FALSE);
+  else if (flags & PTR_FLAGS_HWHEEL)
+    meta_rdp_notify_wheel_scroll (peer_ctx, flags, TRUE);
+
+  return TRUE;
+}
+
+static BOOL
+meta_rdp_extended_mouse_event (rdpInput *input,
+                               UINT16    flags,
+                               UINT16    x,
+                               UINT16    y)
+{
+  MetaRdpPeerContext *peer_ctx = (MetaRdpPeerContext *) input->context;
+  uint32_t button = 0;
+
+  if (!peer_ctx->activated)
+    return TRUE;
+
+  meta_rdp_notify_pointer_position (peer_ctx, x, y);
+
+  if (flags & PTR_XFLAGS_BUTTON1)
+    button = BTN_SIDE;
+  else if (flags & PTR_XFLAGS_BUTTON2)
+    button = BTN_EXTRA;
+
+  if (button)
+    meta_rdp_notify_button (peer_ctx, button, (flags & PTR_XFLAGS_DOWN) ? TRUE : FALSE);
+
+  return TRUE;
+}
+
+static BOOL
+meta_rdp_keyboard_event (rdpInput *input,
+                         UINT16    flags,
+                         UINT16    code)
+{
+  MetaRdpPeerContext *peer_ctx = (MetaRdpPeerContext *) input->context;
+  freerdp_peer *client = input->context->peer;
+  rdpSettings *settings = client->context->settings;
+  uint32_t scan_code, vk_code, full_code, keyboard_locale;
+  ClutterKeyState key_state;
+  gboolean send_release_key = FALSE;
+  gboolean notify = FALSE;
+
+  if (!peer_ctx->activated)
+    return TRUE;
+
+  if (flags & KBD_FLAGS_DOWN)
+    {
+      key_state = CLUTTER_KEY_STATE_PRESSED;
+      notify = TRUE;
+    }
+  else if (flags & KBD_FLAGS_RELEASE)
+    {
+      key_state = CLUTTER_KEY_STATE_RELEASED;
+      notify = TRUE;
+    }
+
+  if (!notify)
+    return TRUE;
+
+  full_code = code;
+  /* Windows 10 reports extended bit for right shift (0x36) under certain
+   * locales due to a bug; drop it. */
+  keyboard_locale = settings->KeyboardLayout & 0xFFFF;
+  if (code == 0x36 &&
+      (keyboard_locale == KBD_CHINESE_TRADITIONAL_US ||
+       keyboard_locale == KBD_CHINESE_SIMPLIFIED_US ||
+       keyboard_locale == KBD_JAPANESE))
+    {
+      flags &= ~KBD_FLAGS_EXTENDED;
+    }
+  else if (flags & KBD_FLAGS_EXTENDED)
+    {
+      full_code |= KBD_FLAGS_EXTENDED;
+    }
+
+  /* Korean HANJA/HANGEUL keys have no release event; synthesize one. */
+#define ATKBD_RET_HANJA 0xf1
+#define ATKBD_RET_HANGEUL 0xf2
+  if (settings->KeyboardType == 8 && settings->KeyboardSubType == 6 &&
+      (full_code == (KBD_FLAGS_EXTENDED | ATKBD_RET_HANJA) ||
+       full_code == (KBD_FLAGS_EXTENDED | ATKBD_RET_HANGEUL)))
+    {
+      if (full_code == (KBD_FLAGS_EXTENDED | ATKBD_RET_HANJA))
+        vk_code = VK_HANJA;
+      else
+        vk_code = VK_HANGUL;
+      send_release_key = TRUE;
+    }
+  else
+    {
+      vk_code = GetVirtualKeyCodeFromVirtualScanCode (full_code,
+                                                      settings->KeyboardType);
+    }
+
+  if (vk_code != VK_HANGUL && vk_code != VK_HANJA)
+    if (flags & KBD_FLAGS_EXTENDED)
+      vk_code |= KBDEXT;
+
+  scan_code = GetKeycodeFromVirtualKeyCode (vk_code, KEYCODE_TYPE_EVDEV);
+
+  meta_rdp_ensure_virtual_keyboard (peer_ctx);
+
+  /* clutter/evdev keycodes are xkb keycodes minus 8. */
+  clutter_virtual_input_device_notify_key (peer_ctx->virtual_keyboard,
+                                           CLUTTER_CURRENT_TIME,
+                                           scan_code - 8,
+                                           key_state);
+
+  if (send_release_key)
+    {
+      clutter_virtual_input_device_notify_key (peer_ctx->virtual_keyboard,
+                                               CLUTTER_CURRENT_TIME,
+                                               scan_code - 8,
+                                               CLUTTER_KEY_STATE_RELEASED);
+    }
+
+#undef ATKBD_RET_HANJA
+#undef ATKBD_RET_HANGEUL
+
+  return TRUE;
+}
+
+static BOOL
+meta_rdp_unicode_keyboard_event (rdpInput *input,
+                                 UINT16    flags,
+                                 UINT16    code)
+{
+  g_warning ("rdp: unhandled unicode keyboard event (flags:0x%X code:0x%X)",
+             flags, code);
+  return TRUE;
+}
+
+static BOOL
+meta_rdp_synchronize_event (rdpInput *input,
+                            UINT32    flags)
+{
+  /* Lock-key sync is a nice-to-have; clutter tracks its own lock state. */
+  return TRUE;
+}
+
 static BOOL
 xf_peer_capabilities (freerdp_peer *client)
 {
@@ -1020,6 +1547,9 @@ xf_peer_activate (freerdp_peer *client)
 
   peer_ctx->activated = TRUE;
   g_message ("rdp: first activation complete for peer %p", client);
+
+  /* Sync the xkb layout to the client's reported RDP keyboard layout. */
+  meta_rdp_apply_keymap (peer_ctx->server, settings);
 
 #ifdef HAVE_FREERDP_GFXREDIR_H
   meta_rdp_setup_gfxredir (peer_ctx);
@@ -1100,6 +1630,9 @@ rdp_peer_context_free (freerdp_peer *client, rdpContext *context)
     return;
 
   meta_rdp_peer_remove_fd_sources (peer_ctx);
+
+  g_clear_object (&peer_ctx->virtual_pointer);
+  g_clear_object (&peer_ctx->virtual_keyboard);
 
 #ifdef HAVE_FREERDP_GFXREDIR_H
   meta_rdp_destroy_buffer (peer_ctx);
@@ -1194,9 +1727,13 @@ rdp_peer_init (freerdp_peer *client, MetaRdpServer *self)
   client->PostConnect = xf_peer_post_connect;
   client->Activate = xf_peer_activate;
 
-  /* Input callbacks land in task 05. */
+  /* Task 05: route RDP keyboard/mouse into mutter's virtual input devices. */
   input = client->context->input;
-  (void) input;
+  input->SynchronizeEvent = meta_rdp_synchronize_event;
+  input->MouseEvent = meta_rdp_mouse_event;
+  input->ExtendedMouseEvent = meta_rdp_extended_mouse_event;
+  input->KeyboardEvent = meta_rdp_keyboard_event;
+  input->UnicodeKeyboardEvent = meta_rdp_unicode_keyboard_event;
 
   handle_count = client->GetEventHandles (client, handles,
                                           META_RDP_MAX_FREERDP_FDS);
