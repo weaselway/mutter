@@ -63,6 +63,7 @@ struct _CoglBuffer
 
   unsigned int size; /* size of the buffer, in bytes */
   CoglBufferUpdateHint update_hint;
+  CoglBufferUsageHint usage_hint;
 
   /* points to the mapped memory when the CoglBuffer is a VBO, PBO,
    * ... or points to allocated memory in the fallback paths */

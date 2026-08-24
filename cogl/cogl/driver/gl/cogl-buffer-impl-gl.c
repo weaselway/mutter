@@ -105,18 +105,44 @@ cogl_buffer_impl_gl_destroy (CoglBufferImpl *impl,
   GE (driver, glDeleteBuffers (1, &gl_impl->gl_handle));
 }
 
+/* The GL usage enum is the product of the two hints: the update hint gives the
+ * frequency (STATIC/DYNAMIC/STREAM), the usage hint gives the direction
+ * (DRAW/READ).
+ *
+ * The direction is not advisory in practice. On d3d12 a *_DRAW buffer becomes
+ * PIPE_USAGE_DEFAULT and lands on a D3D12_HEAP_TYPE_DEFAULT heap, which
+ * can_map_directly() rejects -- so mapping it for reading allocates a staging
+ * buffer, copies through it and blocks on a fence. A *_READ buffer becomes
+ * PIPE_USAGE_STAGING and reaches a readback heap that maps directly. Callers
+ * doing PBO readback must ask for READ or they get the slow path silently. */
 static GLenum
-update_hints_to_gl_enum (CoglBuffer *buffer)
+buffer_hints_to_gl_enum (CoglBuffer *buffer)
 {
-  /* usage hint is always DRAW for now */
-  switch (buffer->update_hint)
+  switch (buffer->usage_hint)
     {
-    case COGL_BUFFER_UPDATE_HINT_STATIC:
-      return GL_STATIC_DRAW;
-    case COGL_BUFFER_UPDATE_HINT_DYNAMIC:
-      return GL_DYNAMIC_DRAW;
-    case COGL_BUFFER_UPDATE_HINT_STREAM:
-      return GL_STREAM_DRAW;
+    case COGL_BUFFER_USAGE_HINT_DRAW:
+      switch (buffer->update_hint)
+        {
+        case COGL_BUFFER_UPDATE_HINT_STATIC:
+          return GL_STATIC_DRAW;
+        case COGL_BUFFER_UPDATE_HINT_DYNAMIC:
+          return GL_DYNAMIC_DRAW;
+        case COGL_BUFFER_UPDATE_HINT_STREAM:
+          return GL_STREAM_DRAW;
+        }
+      break;
+
+    case COGL_BUFFER_USAGE_HINT_READ:
+      switch (buffer->update_hint)
+        {
+        case COGL_BUFFER_UPDATE_HINT_STATIC:
+          return GL_STATIC_READ;
+        case COGL_BUFFER_UPDATE_HINT_DYNAMIC:
+          return GL_DYNAMIC_READ;
+        case COGL_BUFFER_UPDATE_HINT_STREAM:
+          return GL_STREAM_READ;
+        }
+      break;
     }
 
   g_assert_not_reached ();
@@ -153,7 +179,18 @@ recreate_store (CoglBuffer *buffer,
   /* This assumes the buffer is already bound */
 
   gl_target = convert_bind_target_to_gl_target (buffer->last_target);
-  gl_enum = update_hints_to_gl_enum (buffer);
+  gl_enum = buffer_hints_to_gl_enum (buffer);
+
+  /* Which heap the driver picks follows directly from gl_enum, and getting it
+   * wrong is invisible at this layer -- readback still works, just slowly. Let
+   * it be checked from outside without a debugger. */
+  if (G_UNLIKELY (g_getenv ("COGL_DEBUG_BUFFER_USAGE") != NULL))
+    {
+      g_message ("cogl: glBufferData target=0x%x size=%u usage=0x%x (%s)",
+                 gl_target, buffer->size, gl_enum,
+                 buffer->usage_hint == COGL_BUFFER_USAGE_HINT_READ ? "READ"
+                                                                   : "DRAW");
+    }
 
   /* Clear any GL errors */
   cogl_driver_gl_clear_gl_errors (COGL_DRIVER_GL (driver));
