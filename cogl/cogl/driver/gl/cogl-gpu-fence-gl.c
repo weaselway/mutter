@@ -48,6 +48,9 @@ struct _CoglGpuFence
    * one-shot -- once signalled they stay signalled -- so there is no reason to
    * keep asking the driver after the first positive answer. */
   gboolean signalled;
+  /* Cleared after the first poll, which carries GL_SYNC_FLUSH_COMMANDS_BIT.
+   * See cogl_gpu_fence_new() for why the flush is deferred to there. */
+  gboolean needs_flush;
 };
 
 CoglGpuFence *
@@ -73,16 +76,24 @@ cogl_gpu_fence_new (CoglContext *context)
   if (!sync)
     return NULL;
 
-  /* Submit the commands the fence marks. glFenceSync only *orders* the fence
-   * behind them; it does not guarantee they ever reach the GPU. A caller that
-   * renders on damage has no later frame to piggyback a flush on, so without
-   * this the fence can sit unsignalled forever on an idle screen. */
-  GE (driver, glFlush ());
-
+  /* Note there is deliberately no glFlush() here.
+   *
+   * The commands the fence marks do have to be submitted -- glFenceSync only
+   * *orders* the fence behind them -- and a caller that renders on damage has
+   * no later frame to piggyback a flush on, so on an idle screen an unflushed
+   * fence would never signal. But flushing here is the expensive way to get
+   * that: on a threaded-context driver it drains the whole queue on the calling
+   * thread, which profiling showed executing an entire frame's batched draw
+   * calls inline, in the middle of the paint that issued them.
+   *
+   * The first poll carries GL_SYNC_FLUSH_COMMANDS_BIT instead, which the spec
+   * defines as equivalent to flushing before waiting. Same guarantee, and the
+   * work lands in the poll callback rather than on the paint path. */
   fence = g_new0 (CoglGpuFence, 1);
   fence->context = context;
   fence->sync = sync;
   fence->signalled = FALSE;
+  fence->needs_flush = TRUE;
 
   return fence;
 }
@@ -100,10 +111,18 @@ cogl_gpu_fence_is_signalled (CoglGpuFence *fence)
 
   driver = cogl_context_get_driver (fence->context);
 
-  /* Zero timeout: poll, never block. The flush already happened in
-   * cogl_gpu_fence_new(), so GL_SYNC_FLUSH_COMMANDS_BIT is not needed here --
-   * and passing it on every poll would issue a redundant flush each time. */
-  GE_RET (result, driver, glClientWaitSync (fence->sync, 0, 0));
+  /* Zero timeout: poll, never block.
+   *
+   * The first poll carries GL_SYNC_FLUSH_COMMANDS_BIT, which is what guarantees
+   * the commands the fence marks were actually submitted (see
+   * cogl_gpu_fence_new()). Subsequent polls drop it: the flush only needs to
+   * happen once, and repeating it on every poll would be a redundant queue
+   * drain several times per frame. */
+  GE_RET (result, driver,
+          glClientWaitSync (fence->sync,
+                            fence->needs_flush ? GL_SYNC_FLUSH_COMMANDS_BIT : 0,
+                            0));
+  fence->needs_flush = FALSE;
 
   if (result == GL_ALREADY_SIGNALED || result == GL_CONDITION_SATISFIED)
     {
