@@ -996,61 +996,6 @@ meta_rdp_account_update (size_t bytes)
   window_updates = 0;
 }
 
-/* Rolling meter for FreeRDP's socket servicing, in the same shape as the
- * readback meters.
- *
- * rdp_client_activity() runs CheckFileDescriptor() on the main loop: TLS
- * decrypt, PDU parsing and input dispatch, all of it between frames. Profiling
- * shows a visible SSL/BIO stack there, but it has never been measured, and
- * whether it is worth moving to its own thread is exactly the sort of question
- * that should be settled with a number rather than a flame graph's width. */
-static void
-meta_rdp_account_client_activity (int64_t elapsed_us)
-{
-  static const double alpha = 0.2;
-  static int64_t window_start_us = 0;
-  static int64_t window_us = 0;
-  static int64_t window_peak_us = 0;
-  static unsigned window_calls = 0;
-  static double mean_us = -1.0;
-
-  int64_t now_us = g_get_monotonic_time ();
-  int64_t elapsed_window_us;
-
-  window_us += elapsed_us;
-  window_calls++;
-  if (elapsed_us > window_peak_us)
-    window_peak_us = elapsed_us;
-
-  if (window_start_us == 0)
-    {
-      window_start_us = now_us;
-      return;
-    }
-
-  elapsed_window_us = now_us - window_start_us;
-  if (elapsed_window_us < G_USEC_PER_SEC)
-    return;
-
-  double us = (double) window_us / window_calls;
-
-  if (mean_us < 0.0)
-    mean_us = us;
-  else
-    mean_us = alpha * us + (1.0 - alpha) * mean_us;
-
-  g_message ("rdp: client activity %.0f us/call (mean %.0f, peak %.0f), "
-             "%.1f calls/s, %.1f%% of wall",
-             us, mean_us, (double) window_peak_us,
-             window_calls * (double) G_USEC_PER_SEC / elapsed_window_us,
-             100.0 * window_us / elapsed_window_us);
-
-  window_start_us = now_us;
-  window_us = 0;
-  window_peak_us = 0;
-  window_calls = 0;
-}
-
 static void
 meta_rdp_present_codec (MetaRdpPeerContext *peer_ctx,
                         CoglFramebuffer    *framebuffer,
@@ -4126,17 +4071,7 @@ out_clean:
 static gboolean
 rdp_client_activity (gpointer data)
 {
-  int64_t started_us = g_get_monotonic_time ();
-  gboolean keep;
-
-  keep = rdp_client_activity_inner (data);
-
-  /* Only when it survived: the teardown path frees the peer, and charging
-   * destruction to steady-state socket servicing would skew the mean. */
-  if (keep)
-    meta_rdp_account_client_activity (g_get_monotonic_time () - started_us);
-
-  return keep;
+  return rdp_client_activity_inner (data);
 }
 
 static BOOL
