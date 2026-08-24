@@ -212,7 +212,8 @@ typedef struct _MetaRdpPeerContext
   int buffer_width;
   int buffer_height;
   int buffer_stride;
-  size_t buffer_size; /* bytes per buffer, == pool stride between buffers */
+  size_t buffer_size; /* live bytes per buffer; buffers are spaced further
+                       * apart than this, see meta_rdp_ensure_buffer() */
   /* presentIds are globally monotonic and never reused. On a pool rebuild this
    * records the highest id issued against the old pool, so a late ack for a
    * destroyed buffer cannot retire the same-numbered buffer of the new one. */
@@ -694,16 +695,20 @@ meta_rdp_allocate_shared_memory (MetaRdpPeerContext *peer_ctx,
       goto error;
     }
 
-  if (fallocate (fd, 0, 0, size) < 0)
+  if (fallocate (fd, 0, 0, (off_t) size) < 0)
     {
-      g_warning ("rdp: fallocate shm failed: %s", g_strerror (errno));
+      /* EINVAL here is most often a zero length rather than anything to do
+       * with the filesystem, so say what was asked for. */
+      g_warning ("rdp: fallocate shm %zu bytes failed: %s",
+                 size, g_strerror (errno));
       goto error;
     }
 
   addr = mmap (NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
   if (addr == MAP_FAILED)
     {
-      g_warning ("rdp: mmap shm failed: %s", g_strerror (errno));
+      g_warning ("rdp: mmap shm %zu bytes failed: %s",
+                 size, g_strerror (errno));
       goto error;
     }
 
@@ -716,7 +721,13 @@ meta_rdp_allocate_shared_memory (MetaRdpPeerContext *peer_ctx,
 
 error:
   if (fd >= 0)
-    close (fd);
+    {
+      close (fd);
+      /* The file exists from here on; without this a failed allocation leaves
+       * it behind in the shared-memory mount forever, since nothing else
+       * knows its name. */
+      unlink (path);
+    }
   peer_ctx->shm_name[0] = '\0';
   return FALSE;
 }
@@ -752,6 +763,15 @@ meta_rdp_destroy_buffer (MetaRdpPeerContext *peer_ctx)
 
   meta_rdp_free_shared_memory (peer_ctx);
 
+  /* Every present issued so far named a buffer that no longer exists. Their
+   * acks may still be in flight -- or may never arrive at all, if the client
+   * discarded them along with the pool -- so refuse to retire anything at or
+   * below this id; the counters are reset below regardless. */
+  g_mutex_lock (&peer_ctx->gfxredir_mutex);
+  peer_ctx->present_id_floor = peer_ctx->current_frame_id;
+  peer_ctx->gfxredir_n_acked = 0;
+  g_mutex_unlock (&peer_ctx->gfxredir_mutex);
+
   for (int i = 0; i < META_RDP_N_BUFFERS; i++)
     {
       g_clear_pointer (&peer_ctx->buffers[i].stale, mtk_region_unref);
@@ -774,10 +794,39 @@ meta_rdp_ensure_buffer (MetaRdpPeerContext *peer_ctx,
   GfxRedirServerContext *redir = peer_ctx->gfxredir;
   int stride = width * 4;
   size_t size = (size_t) stride * height;
-  size_t pool_size = size * META_RDP_N_BUFFERS;
+  /* Buffers are spaced a whole number of pages apart rather than packed back
+   * to back.
+   *
+   * Two reasons. The pool is a mapped file, so its total length has to be page
+   * aligned -- fallocate() on the virtio-fs/DAX mount rejects anything else
+   * with EINVAL, and an odd height alone is enough to break that. Weston
+   * rounds the same way (rdprail.c, copy_buffer_size).
+   *
+   * The spacing also fixes the alignment of meta_rdp_copy_between_buffers():
+   * it memcpy()s row by row between two buffers at identical positions, so the
+   * source and destination differ by exactly the gap between them. Packed
+   * back to back that gap is stride * height, which shares alignment only when
+   * the stride happens to be a multiple of 64 -- true at width 1920, false at
+   * an arbitrary client width (1009 gives a stride of 4036, 4 mod 64). A page
+   * multiple is aligned by construction, so both sides always agree.
+   *
+   * Only the spacing changes; each buffer still holds exactly stride * height
+   * bytes and the slack sits unused at its end. The client is told the real
+   * offsets in CREATE_BUFFER, so it needs to know nothing about this. */
+  size_t page_size = (size_t) sysconf (_SC_PAGESIZE);
+  size_t buffer_pitch = (size + page_size - 1) & ~(page_size - 1);
+  size_t pool_size = buffer_pitch * META_RDP_N_BUFFERS;
   unsigned short section_name[META_RDP_SHARED_MEMORY_NAME_SIZE + 1];
   GFXREDIR_OPEN_POOL_PDU open_pool = { 0 };
   uint32_t i;
+
+  if (width <= 0 || height <= 0)
+    {
+      /* Nothing sane to allocate. Bail here rather than let it reach
+       * fallocate(), which reports a zero length as a bare EINVAL. */
+      g_warning ("rdp: refusing to create a %dx%d gfxredir pool", width, height);
+      return FALSE;
+    }
 
   if (peer_ctx->buffer_created &&
       peer_ctx->buffer_width == width && peer_ctx->buffer_height == height)
@@ -785,13 +834,6 @@ meta_rdp_ensure_buffer (MetaRdpPeerContext *peer_ctx,
 
   if (peer_ctx->buffer_created)
     meta_rdp_destroy_buffer (peer_ctx);
-
-  /* Every present issued so far belongs to the pool we just tore down. Acks
-   * for them may still be in flight; retire nothing at or below this id. */
-  g_mutex_lock (&peer_ctx->gfxredir_mutex);
-  peer_ctx->present_id_floor = peer_ctx->current_frame_id;
-  peer_ctx->gfxredir_n_acked = 0;
-  g_mutex_unlock (&peer_ctx->gfxredir_mutex);
 
   if (!meta_rdp_allocate_shared_memory (peer_ctx, pool_size))
     return FALSE;
@@ -819,7 +861,7 @@ meta_rdp_ensure_buffer (MetaRdpPeerContext *peer_ctx,
   for (i = 0; i < META_RDP_N_BUFFERS; i++)
     {
       GFXREDIR_CREATE_BUFFER_PDU create_buffer = { 0 };
-      size_t offset = (size_t) i * size;
+      size_t offset = (size_t) i * buffer_pitch;
 
       create_buffer.poolId = META_RDP_POOL_ID;
       create_buffer.bufferId = META_RDP_BUFFER_ID (i);
@@ -1142,6 +1184,28 @@ meta_rdp_peer_sync_desktop_size (MetaRdpPeerContext *peer_ctx,
 
   g_message ("rdp: desktop resized to %dx%d, notifying peer %p",
              width, height, client);
+
+  /* Drop the pool now, while the channel is still healthy, rather than
+   * leaving it to the next present.
+   *
+   * The client throws its gfxredir state away when it processes the
+   * DesktopResize -- including any presents it had not yet acked. Those acks
+   * are never coming, so buffers left in flight here would stay in flight
+   * forever, and meta_rdp_peer_present() would then refuse every subsequent
+   * frame on the "all buffers busy" check before ever reaching the code that
+   * rebuilds the pool. Under continuous damage (glxgears) both buffers are
+   * typically in flight at this point, so that deadlock is the common case,
+   * not the rare one.
+   *
+   * This also gets DestroyBuffer/ClosePool onto the wire ahead of the resize
+   * so the client releases the mapping deterministically instead of relying
+   * on the two channels being ordered against each other. */
+  meta_rdp_destroy_buffer (peer_ctx);
+
+  /* Accumulated damage refers to the old framebuffer; the repaint after
+   * re-activation covers the whole screen anyway. */
+  peer_ctx->frame_missed = FALSE;
+  g_clear_pointer (&peer_ctx->missed_damage, mtk_region_unref);
 
   (void) freerdp_settings_set_uint32 (settings, FreeRDP_DesktopWidth,
                                       (UINT32) width);
