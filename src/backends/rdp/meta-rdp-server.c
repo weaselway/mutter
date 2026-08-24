@@ -61,6 +61,7 @@
 #ifdef HAVE_FREERDP_GFXREDIR_H
 #include <freerdp/server/gfxredir.h>
 #endif
+#include <freerdp/server/drdynvc.h>
 
 /* From Weston's rdp.c: an upper bound on the number of FreeRDP event handles
  * (listener or per-peer, +1 for the virtual channel manager). */
@@ -121,6 +122,10 @@ typedef struct _MetaRdpPeerContext
   /* Fallback (codec) present path: NSCodec / raw over the wire. */
   NSC_CONTEXT *nsc_context;
   wStream *encode_stream;
+
+  /* Dynamic virtual channel manager, driven to DRDYNVC_STATE_READY before
+   * opening DVCs such as gfxredir. */
+  DrdynvcServerContext *drdynvc;
 
 #ifdef HAVE_FREERDP_GFXREDIR_H
   /* Fast path: gfxredir shared-memory present. */
@@ -956,6 +961,58 @@ gfxredir_present_buffer_ack (GfxRedirServerContext                 *context,
   return CHANNEL_RC_OK;
 }
 
+static gboolean
+meta_rdp_ensure_drdynvc (MetaRdpPeerContext *peer_ctx)
+{
+  freerdp_peer *client = peer_ctx->peer;
+  DrdynvcServerContext *drdynvc;
+  int wait_retry = 0;
+
+  if (peer_ctx->drdynvc)
+    return TRUE;
+
+  if (!peer_ctx->vcm)
+    return FALSE;
+
+  drdynvc = drdynvc_server_context_new (peer_ctx->vcm);
+  if (!drdynvc)
+    {
+      g_warning ("rdp: drdynvc_server_context_new failed");
+      return FALSE;
+    }
+
+  if (drdynvc->Start (drdynvc) != CHANNEL_RC_OK)
+    {
+      g_warning ("rdp: drdynvc Start failed");
+      drdynvc_server_context_free (drdynvc);
+      return FALSE;
+    }
+
+  peer_ctx->drdynvc = drdynvc;
+
+  /* Force the dynamic virtual channel to exchange caps and reach READY before
+   * any DVC (e.g. gfxredir) is opened. Ported from Weston's rdp_drdynvc_init. */
+  if (WTSVirtualChannelManagerGetDrdynvcState (peer_ctx->vcm) ==
+      DRDYNVC_STATE_NONE)
+    {
+      client->activated = TRUE;
+      while (WTSVirtualChannelManagerGetDrdynvcState (peer_ctx->vcm) !=
+             DRDYNVC_STATE_READY)
+        {
+          if (++wait_retry > 10000) /* ~100s timeout */
+            {
+              g_warning ("rdp: drdynvc did not reach READY state");
+              return FALSE;
+            }
+          g_usleep (10000); /* 0.01s */
+          client->CheckFileDescriptor (client);
+          WTSVirtualChannelManagerCheckFileDescriptor (peer_ctx->vcm);
+        }
+    }
+
+  return TRUE;
+}
+
 static void
 meta_rdp_setup_gfxredir (MetaRdpPeerContext *peer_ctx)
 {
@@ -971,6 +1028,13 @@ meta_rdp_setup_gfxredir (MetaRdpPeerContext *peer_ctx)
   if (!peer_ctx->vcm)
     {
       g_warning ("rdp: no vcm; cannot set up gfxredir");
+      return;
+    }
+
+  /* gfxredir is a dynamic virtual channel; drdynvc must be READY first. */
+  if (!meta_rdp_ensure_drdynvc (peer_ctx))
+    {
+      g_warning ("rdp: drdynvc not ready; using codec fallback path");
       return;
     }
 
@@ -996,6 +1060,28 @@ meta_rdp_setup_gfxredir (MetaRdpPeerContext *peer_ctx)
   peer_ctx->gfxredir = redir;
   peer_ctx->use_gfxredir = TRUE;
   g_message ("rdp: gfxredir channel opened; awaiting caps advertise");
+
+  /* DIAGNOSTIC: pump the peer briefly and report whether the client accepts
+   * the gfxredir DVC (i.e. sends a caps advertise). */
+  {
+    freerdp_peer *client = peer_ctx->peer;
+    int wait_retry = 0;
+
+    while (!peer_ctx->gfxredir_activated && wait_retry < 200) /* ~2s */
+      {
+        wait_retry++;
+        g_usleep (10000);
+        client->CheckFileDescriptor (client);
+        WTSVirtualChannelManagerCheckFileDescriptor (peer_ctx->vcm);
+      }
+
+    if (peer_ctx->gfxredir_activated)
+      g_message ("rdp: DIAG gfxredir caps advertise received after %d ms",
+                 wait_retry * 10);
+    else
+      g_message ("rdp: DIAG client sent NO gfxredir caps advertise within 2s "
+                 "(client likely does not support gfxredir in this mode)");
+  }
 }
 #endif /* HAVE_FREERDP_GFXREDIR_H */
 
@@ -1682,6 +1768,13 @@ rdp_peer_context_free (freerdp_peer *client, rdpContext *context)
       peer_ctx->gfxredir = NULL;
     }
 #endif
+
+  if (peer_ctx->drdynvc)
+    {
+      peer_ctx->drdynvc->Stop (peer_ctx->drdynvc);
+      drdynvc_server_context_free (peer_ctx->drdynvc);
+      peer_ctx->drdynvc = NULL;
+    }
 
   if (peer_ctx->encode_stream)
     {
