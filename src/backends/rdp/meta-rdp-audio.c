@@ -279,6 +279,9 @@ struct _MetaRdpAudioOut
    * (Weston relied on pthread_cancel() for this). */
   int block_sem;
   int exit_fd;
+
+  MetaRdpAudioFlushFunc flush;
+  gpointer flush_data;
 };
 
 static AUDIO_FORMAT rdp_audio_out_format = { WAVE_FORMAT_PCM, 2, 44100, 176400, 4, 16, 0, NULL };
@@ -479,7 +482,16 @@ rdp_audio_out_forward_packet (MetaRdpAudioOut *audio_out)
 
       if (!rdp_audio_block_sem_release (audio_out))
         return FALSE;
+
+      /* Nothing was queued, so nothing to push out. */
+      return TRUE;
     }
+
+  /* SendSamples only queues; without this the bytes sit there until the main
+   * loop next runs, which is exactly the coupling to rendering we are trying
+   * to avoid. Do it here, on this thread. */
+  if (audio_out->flush)
+    audio_out->flush (audio_out->flush_data);
 
   return TRUE;
 }
@@ -597,7 +609,9 @@ on_rdpsnd_activated (RdpsndServerContext *context)
 }
 
 MetaRdpAudioOut *
-meta_rdp_audio_out_new (HANDLE vcm)
+meta_rdp_audio_out_new (HANDLE                 vcm,
+                        MetaRdpAudioFlushFunc  flush,
+                        gpointer               flush_data)
 {
   MetaRdpAudioOut *audio_out;
   AUDIO_FORMAT *server_formats;
@@ -607,6 +621,8 @@ meta_rdp_audio_out_new (HANDLE vcm)
 
   audio_out = g_new0 (MetaRdpAudioOut, 1);
   audio_out->sink_fd = -1;
+  audio_out->flush = flush;
+  audio_out->flush_data = flush_data;
 
   audio_out->rdpsnd = rdpsnd_server_context_new (vcm);
   if (!audio_out->rdpsnd)
