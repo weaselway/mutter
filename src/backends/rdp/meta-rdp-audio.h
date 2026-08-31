@@ -26,6 +26,13 @@
 G_BEGIN_DECLS
 
 typedef struct _MetaRdpAudioOut MetaRdpAudioOut;
+
+/* Push whatever the RDP channels have queued out to the socket. Called from
+ * the playback thread after each packet, because the queue is otherwise only
+ * drained by the main loop -- which means audio would go out at the mercy of
+ * the render loop and stutter whenever a frame took too long. Must be safe to
+ * call from a thread that is not the main one. */
+typedef void (* MetaRdpAudioFlushFunc) (gpointer user_data);
 typedef struct _MetaRdpAudioIn MetaRdpAudioIn;
 
 /* Create the rdpsnd server channel for this peer and start forwarding
@@ -35,8 +42,13 @@ typedef struct _MetaRdpAudioIn MetaRdpAudioIn;
  *
  * Success here does not mean PipeWire was reachable: the connection is made
  * from a worker thread once the client negotiates a format, and is retried
- * until it succeeds. */
-MetaRdpAudioOut * meta_rdp_audio_out_new (HANDLE vcm);
+ * until it succeeds.
+ *
+ * flush (may be NULL) is invoked from that worker thread after every packet;
+ * see MetaRdpAudioFlushFunc. */
+MetaRdpAudioOut * meta_rdp_audio_out_new (HANDLE                 vcm,
+                                          MetaRdpAudioFlushFunc  flush,
+                                          gpointer               flush_data);
 
 void meta_rdp_audio_out_free (MetaRdpAudioOut *audio_out);
 
