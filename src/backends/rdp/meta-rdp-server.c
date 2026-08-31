@@ -19,6 +19,7 @@
 #include "config.h"
 
 #include "backends/rdp/meta-rdp-server.h"
+#include "backends/rdp/meta-rdp-audio.h"
 #include "backends/rdp/meta-rdp-clipboard.h"
 
 #include "backends/meta-backend-private.h"
@@ -157,6 +158,12 @@ typedef struct _MetaRdpPeerContext
   /* Aliases the fd_sources[] entry watching the cliprdr event handle, so the
    * source can be torn down together with the bridge (the fd dies with it). */
   GSource *clipboard_fd_source;
+
+  /* PulseAudio-over-RDP bridge (rdpsnd playback / audin capture), created on
+   * first activation. Each runs its own accept/read thread, so unlike
+   * clipboard there is no main-loop fd source to track here. */
+  MetaRdpAudioOut *audio_out;
+  MetaRdpAudioIn *audio_in;
 
   /* Debounced pointer button state, indexed by (button - BTN_LEFT). */
   gboolean button_state[8];
@@ -3879,6 +3886,11 @@ xf_peer_activate (freerdp_peer *client)
    * caps PDU we queue here (Weston opens disp first for the same reason). */
   meta_rdp_setup_disp (peer_ctx);
 
+  if (!peer_ctx->audio_out)
+    peer_ctx->audio_out = meta_rdp_audio_out_new (peer_ctx->vcm);
+  if (!peer_ctx->audio_in)
+    peer_ctx->audio_in = meta_rdp_audio_in_new (peer_ctx->vcm);
+
   meta_rdp_setup_gfxredir (peer_ctx);
 
   if (peer_ctx->use_gfxredir)
@@ -4015,6 +4027,9 @@ rdp_peer_context_free (freerdp_peer *client, rdpContext *context)
    * alias so the helper does not touch a destroyed GSource. */
   peer_ctx->clipboard_fd_source = NULL;
   meta_rdp_peer_clear_clipboard (peer_ctx);
+
+  g_clear_pointer (&peer_ctx->audio_out, meta_rdp_audio_out_free);
+  g_clear_pointer (&peer_ctx->audio_in, meta_rdp_audio_in_free);
 
   /* destroy_buffer() cancels any outstanding readback; this additionally drops
    * the PBO itself, which outlives individual pools. */
