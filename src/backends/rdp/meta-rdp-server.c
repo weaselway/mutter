@@ -34,6 +34,7 @@
 #include "backends/meta-virtual-monitor.h"
 #include "clutter/clutter.h"
 #include "clutter/clutter-cursor-private.h"
+#include "clutter/clutter-event-private.h"
 #include "cogl/cogl.h"
 #include "meta/meta-backend.h"
 #include "meta/meta-keymap-description.h"
@@ -74,6 +75,8 @@
 #include <freerdp/channels/disp.h>
 #include <freerdp/channels/drdynvc.h>
 #include <freerdp/server/drdynvc.h>
+#include <freerdp/server/rdpei.h>
+#include <freerdp/channels/rdpei.h>
 
 /* From Weston's rdp.c: an upper bound on the number of FreeRDP event handles
  * (listener or per-peer, +1 for the virtual channel manager). */
@@ -209,6 +212,59 @@ typedef struct _MetaRdpPeerContext
    * client's surface is the old size until it comes back, so nothing may be
    * presented in the meantime. */
   gboolean resize_pending;
+
+  /* MS-RDPEI: touch input, used to synthesize touchpad-gesture ClutterEvents
+   * (3+ finger swipes -> workspace switch/overview, same as a real Precision
+   * Touchpad) via clutter_event_put(). rdpei_server_open() spawns its own
+   * reader thread, like gfxredir, so onTouchEvent does not run on the main
+   * thread; clutter_event_put() is not thread safe, so touch data is only
+   * recorded here (under rdpei_mutex) and the actual events are queued for
+   * the main loop to emit via rdpei_idle_id. */
+  RdpeiServerContext *rdpei;
+  GMutex rdpei_mutex;
+  guint rdpei_idle_id;
+  /* Latest known position of each active contact: contactId (GUINT_TO_POINTER)
+   * -> owned graphene_point_t*, in the same session-pixel space the client's
+   * touch contacts arrive in. */
+  GHashTable *rdpei_contacts;
+  gboolean rdpei_gesture_active;
+  uint32_t rdpei_gesture_fingers;
+  graphene_point_t rdpei_gesture_prev_centroid;
+  /* Debouncing for contact-count noise: Precision touchpads can transiently
+   * under-report a finger's contact for a frame or two mid-swipe (more
+   * likely the slower/more deliberate the swipe, since per-finger pressure
+   * is less uniform than in a quick flick). Without debouncing, that blip
+   * looks identical to the user actually lifting/adding a finger, which
+   * forces an end-and-restart of the whole gesture -- silently discarding
+   * GNOME Shell's accumulated swipe progress right when it matters most
+   * (near release). See meta_rdp_rdpei_evaluate_gesture_locked(). */
+  uint32_t rdpei_gesture_low_streak;
+  uint32_t rdpei_gesture_pending_fingers;
+  uint32_t rdpei_gesture_pending_streak;
+  /* Diagnostics only: total delta accumulated since the current gesture's
+   * BEGIN, logged at CANCEL/END so it's possible to tell from the logs
+   * whether a revert was due to too little accumulated travel or a
+   * spurious restart discarding otherwise-sufficient travel. */
+  float rdpei_gesture_total_dx;
+  float rdpei_gesture_total_dy;
+  /* Diagnostics only: running sum of the delta actually dispatched to
+   * Clutter since the current gesture's BEGIN,
+   * tracked in meta_rdp_rdpei_dispatch() so logs can show exactly what
+   * GNOME Shell's SwipeTracker is accumulating as progress. */
+  float rdpei_gesture_dispatched_dx;
+  float rdpei_gesture_dispatched_dy;
+  /* MetaRdpPendingGesture* queued by onTouchEvent, drained and emitted by
+   * meta_rdp_rdpei_dispatch() on the main loop. */
+  GQueue *rdpei_pending_gestures;
+
+  /* Last pointer position we told Clutter about (meta_rdp_notify_pointer_position),
+   * in the same scaled Clutter coordinate space as ClutterEvent.coords. Mouse
+   * events and the rdpei dispatch above both only ever run on the main
+   * thread, so this needs no locking of its own. Used as the touchpad-gesture
+   * event's "coords" field, which is otherwise meaningless for a device with
+   * no natural on-screen position. */
+  float last_pointer_x;
+  float last_pointer_y;
 
   /* Fast path: gfxredir shared-memory present. */
   GfxRedirServerContext *gfxredir;
@@ -3195,6 +3251,513 @@ meta_rdp_setup_gfxredir (MetaRdpPeerContext *peer_ctx)
 }
 
 /* ------------------------------------------------------------------ */
+/* MS-RDPEI: touch input -> synthesized touchpad-gesture ClutterEvents */
+/* ------------------------------------------------------------------ */
+
+/* 3 is the point at which a real Precision Touchpad's own gestures (single-
+ * finger pointing, two-finger scroll) give way to multi-finger swipes; below
+ * that this stays out of the way entirely, matching the FreeRDP SDL client's
+ * kMinContactsToForward. */
+#define META_RDP_GESTURE_MIN_FINGERS 3
+
+/* Client-sent contact coordinates are session-pixel-space excursions around
+ * whatever anchor the client chose (see the SDL client's kGestureAnchor).
+ * The scale below maps that into GNOME Shell's own delta units
+ * (ui/swipeTracker.js, not in this tree): confirmed from the actual
+ * upstream source, touchpad-swipe progress is `progress += delta /
+ * distance`, where `delta` is `event.get_gesture_motion_delta_unaccelerated()`
+ * (the same units libinput reports for real touchpad hardware) and
+ * `distance` is a *fixed* per-orientation constant --
+ * TOUCHPAD_BASE_WIDTH = 400 (horizontal, workspace switch) or
+ * TOUCHPAD_BASE_HEIGHT = 300 (vertical, overview) -- not tied to monitor or
+ * window size at all. A real swipe only needs to accumulate ~300-400 total
+ * delta units over its whole physical motion. Our earlier assumption that
+ * "distance" scaled with screen pixels (hundreds to 1000+ px) was wrong and
+ * made this value (previously 6.0) about an order of magnitude too large:
+ * with session-pixel-space deltas already in the tens-to-hundreds range per
+ * update, a single frame of real movement could already blow past the
+ * required ~350, hence gestures committing near-instantly ("too fast") the
+ * moment any movement was detected. At release, if velocity is below
+ * SwipeTracker's VELOCITY_THRESHOLD_TOUCHPAD it snaps to whichever endpoint
+ * accumulated *progress* is closer to; above that it projects from
+ * velocity instead -- so this only needs to get the total travel roughly
+ * right, not pixel-perfect. Tune alongside the client's kGestureScale if
+ * gestures still need too much or too little travel, or overshoot/never
+ * commit -- this also depends on window pixel size, since the source
+ * coordinates are session pixels, not touchpad-physical units. */
+#define META_RDP_GESTURE_DELTA_SCALE 0.5f
+
+/* How many consecutive onTouchEvent frames a finger-count change (including
+ * dropping below META_RDP_GESTURE_MIN_FINGERS) must persist before it's
+ * treated as real, rather than one-off HID contact-detection noise. See the
+ * rdpei_gesture_low_streak/rdpei_gesture_pending_* field comments. */
+#define META_RDP_GESTURE_FINGER_DEBOUNCE 3
+
+/* Deliberately *not* done here: direction/axis locking, i.e. deciding a
+ * swipe is horizontal or vertical and zeroing the other component. GNOME
+ * Shell's TouchpadSwipeGesture (js/ui/swipeTracker.js) already does it, and
+ * owns the decision: it accumulates motion until DRAG_THRESHOLD_DISTANCE,
+ * classifies the gesture by whichever of |cdx|/|cdy| is larger, and puts
+ * every SwipeTracker whose orientation doesn't match into its ignored state
+ * -- so exactly one tracker ever begins, and it consumes only its own axis
+ * afterwards. Locking here as well just raced that with a second, coarser
+ * threshold and could pre-empt Shell's choice on a near-diagonal swipe.
+ * Forward honest dx/dy and let Shell classify. */
+
+typedef struct
+{
+  ClutterTouchpadGesturePhase phase;
+  uint32_t fingers;
+  float dx;
+  float dy;
+} MetaRdpPendingGesture;
+
+static void
+meta_rdp_pending_gesture_free (MetaRdpPendingGesture *pending)
+{
+  g_free (pending);
+}
+
+/* Runs on the main loop: pops everything onTouchEvent queued (on the rdpei
+ * channel's own thread, see the peer context field comments) and turns each
+ * into a real ClutterEvent. */
+
+/* touchpad-gesture ClutterEvents need a real ClutterInputDevice as their
+ * source -- ClutterVirtualInputDevice (what peer_ctx->virtual_pointer is) is
+ * a plain GObject, not a ClutterInputDevice, so it cannot be used here.
+ * Prefer an actual touchpad if the host has one (most natural source for a
+ * touchpad-gesture event); any pointer-capable device works as a fallback,
+ * since Clutter's gesture dispatch switches on event type, not device
+ * type/identity. */
+static ClutterInputDevice *
+meta_rdp_rdpei_find_source_device (ClutterSeat *seat)
+{
+  g_autoptr (GList) devices = clutter_seat_list_devices (seat);
+  ClutterInputDevice *fallback = NULL;
+  const GList *l;
+
+  for (l = devices; l; l = l->next)
+    {
+      ClutterInputDevice *device = l->data;
+
+      switch (clutter_input_device_get_device_type (device))
+        {
+        case CLUTTER_TOUCHPAD_DEVICE:
+          return device;
+        case CLUTTER_POINTER_DEVICE:
+          if (!fallback)
+            fallback = device;
+          break;
+        default:
+          break;
+        }
+    }
+
+  return fallback;
+}
+
+static const char *
+meta_rdp_gesture_phase_name (ClutterTouchpadGesturePhase phase)
+{
+  switch (phase)
+    {
+    case CLUTTER_TOUCHPAD_GESTURE_PHASE_BEGIN:
+      return "BEGIN";
+    case CLUTTER_TOUCHPAD_GESTURE_PHASE_UPDATE:
+      return "UPDATE";
+    case CLUTTER_TOUCHPAD_GESTURE_PHASE_END:
+      return "END";
+    case CLUTTER_TOUCHPAD_GESTURE_PHASE_CANCEL:
+      return "CANCEL";
+    }
+  return "?";
+}
+
+static gboolean
+meta_rdp_rdpei_dispatch (gpointer user_data)
+{
+  MetaRdpPeerContext *peer_ctx = user_data;
+  ClutterSeat *seat;
+  ClutterInputDevice *source_device;
+  GQueue *pending;
+  graphene_point_t coords;
+
+  g_mutex_lock (&peer_ctx->rdpei_mutex);
+  pending = peer_ctx->rdpei_pending_gestures;
+  peer_ctx->rdpei_pending_gestures = g_queue_new ();
+  peer_ctx->rdpei_idle_id = 0;
+  g_mutex_unlock (&peer_ctx->rdpei_mutex);
+
+  seat = clutter_backend_get_default_seat (clutter_get_default_backend ());
+  source_device = meta_rdp_rdpei_find_source_device (seat);
+  if (!source_device)
+    {
+      g_warning ("rdp: no pointer-capable ClutterInputDevice found; dropping touchpad gesture");
+      g_queue_free_full (pending, (GDestroyNotify) meta_rdp_pending_gesture_free);
+      return G_SOURCE_REMOVE;
+    }
+  coords = GRAPHENE_POINT_INIT (peer_ctx->last_pointer_x, peer_ctx->last_pointer_y);
+
+  while (!g_queue_is_empty (pending))
+    {
+      MetaRdpPendingGesture *item = g_queue_pop_head (pending);
+      graphene_point_t delta = GRAPHENE_POINT_INIT (item->dx, item->dy);
+      ClutterEvent *event;
+
+      if (item->phase == CLUTTER_TOUCHPAD_GESTURE_PHASE_BEGIN)
+        {
+          peer_ctx->rdpei_gesture_dispatched_dx = 0.0f;
+          peer_ctx->rdpei_gesture_dispatched_dy = 0.0f;
+        }
+      else if (item->phase == CLUTTER_TOUCHPAD_GESTURE_PHASE_UPDATE)
+        {
+          peer_ctx->rdpei_gesture_dispatched_dx += item->dx;
+          peer_ctx->rdpei_gesture_dispatched_dy += item->dy;
+        }
+
+      /* TOUCHPAD_BASE_WIDTH/HEIGHT from GNOME Shell's swipeTracker.js: the
+       * fixed (not screen-size-related) distance its progress is
+       * normalized against for horizontal/vertical touchpad swipes,
+       * respectively -- included here so the running sums below can be
+       * read directly as an approximate progress percentage. */
+      g_message ("rdp: rdpei -> clutter touchpad-swipe %s fingers=%u delta=(%.1f,%.1f) "
+                 "running=(%.1f,%.1f) [~%.0f%% of 400 horiz, ~%.0f%% of 300 vert]",
+                 meta_rdp_gesture_phase_name (item->phase), item->fingers,
+                 (double) item->dx, (double) item->dy,
+                 (double) peer_ctx->rdpei_gesture_dispatched_dx,
+                 (double) peer_ctx->rdpei_gesture_dispatched_dy,
+                 (double) (peer_ctx->rdpei_gesture_dispatched_dx / 400.0f * 100.0f),
+                 (double) (peer_ctx->rdpei_gesture_dispatched_dy / 300.0f * 100.0f));
+
+      event = clutter_event_touchpad_swipe_new (CLUTTER_EVENT_NONE,
+                                                g_get_monotonic_time (),
+                                                source_device,
+                                                item->phase,
+                                                item->fingers,
+                                                coords,
+                                                delta,
+                                                delta);
+      clutter_event_put (event);
+      clutter_event_free (event);
+
+      meta_rdp_pending_gesture_free (item);
+    }
+
+  g_queue_free (pending);
+
+  return G_SOURCE_REMOVE;
+}
+
+/* Call with rdpei_mutex held. */
+static void
+meta_rdp_rdpei_queue_gesture_locked (MetaRdpPeerContext          *peer_ctx,
+                                     ClutterTouchpadGesturePhase  phase,
+                                     uint32_t                     fingers,
+                                     float                        dx,
+                                     float                        dy)
+{
+  MetaRdpPendingGesture *pending = g_new (MetaRdpPendingGesture, 1);
+
+  pending->phase = phase;
+  pending->fingers = fingers;
+  pending->dx = dx;
+  pending->dy = dy;
+
+  g_queue_push_tail (peer_ctx->rdpei_pending_gestures, pending);
+
+  if (!peer_ctx->rdpei_idle_id)
+    peer_ctx->rdpei_idle_id = g_idle_add (meta_rdp_rdpei_dispatch, peer_ctx);
+}
+
+/* Call with rdpei_mutex held. Re-evaluates gesture state against the
+ * currently-tracked contacts after onTouchEvent has updated them for one
+ * frame, queuing whatever ClutterEvent(s) that transition implies. */
+static void
+meta_rdp_rdpei_evaluate_gesture_locked (MetaRdpPeerContext *peer_ctx)
+{
+  guint n_contacts = g_hash_table_size (peer_ctx->rdpei_contacts);
+
+  if (n_contacts < META_RDP_GESTURE_MIN_FINGERS)
+    {
+      if (!peer_ctx->rdpei_gesture_active)
+        return;
+
+      /* Debounce: don't tear the gesture down over what might be a single
+       * transient HID under-report (e.g. one finger of a staggered
+       * release lifting slightly before the others). */
+      peer_ctx->rdpei_gesture_low_streak++;
+      if (peer_ctx->rdpei_gesture_low_streak < META_RDP_GESTURE_FINGER_DEBOUNCE)
+        {
+          /* Refresh prev_centroid from whatever contacts remain (if any)
+           * so that if the count recovers, the next delta is computed
+           * against a *current* reference instead of one that's stale
+           * from before the dip -- otherwise recovery produces one large
+           * (and often backwards-pointing) spurious jump. This is what
+           * caused the "jumps back a bit, then animates to the target"
+           * artifact on release: a staggered release's momentary dip
+           * below the threshold was tolerated correctly, but the eventual
+           * real END (or a same-count recovery) still diffed against a
+           * centroid from before the dip. */
+          if (n_contacts > 0)
+            {
+              GHashTableIter iter;
+              gpointer key, value;
+              float sum_x = 0.0f, sum_y = 0.0f;
+
+              g_hash_table_iter_init (&iter, peer_ctx->rdpei_contacts);
+              while (g_hash_table_iter_next (&iter, &key, &value))
+                {
+                  graphene_point_t *p = value;
+
+                  sum_x += p->x;
+                  sum_y += p->y;
+                }
+              peer_ctx->rdpei_gesture_prev_centroid.x = sum_x / n_contacts;
+              peer_ctx->rdpei_gesture_prev_centroid.y = sum_y / n_contacts;
+            }
+          return;
+        }
+
+      g_message ("rdp: rdpei gesture END (fingers=%u, total emitted delta=(%.1f,%.1f))",
+                 peer_ctx->rdpei_gesture_fingers,
+                 (double) peer_ctx->rdpei_gesture_total_dx,
+                 (double) peer_ctx->rdpei_gesture_total_dy);
+      meta_rdp_rdpei_queue_gesture_locked (peer_ctx,
+                                           CLUTTER_TOUCHPAD_GESTURE_PHASE_END,
+                                           peer_ctx->rdpei_gesture_fingers,
+                                           0.0f, 0.0f);
+      peer_ctx->rdpei_gesture_active = FALSE;
+      peer_ctx->rdpei_gesture_low_streak = 0;
+      return;
+    }
+
+  peer_ctx->rdpei_gesture_low_streak = 0;
+
+  {
+    GHashTableIter iter;
+    gpointer key, value;
+    float sum_x = 0.0f, sum_y = 0.0f;
+    graphene_point_t centroid;
+
+    g_hash_table_iter_init (&iter, peer_ctx->rdpei_contacts);
+    while (g_hash_table_iter_next (&iter, &key, &value))
+      {
+        graphene_point_t *p = value;
+
+        sum_x += p->x;
+        sum_y += p->y;
+      }
+    centroid.x = sum_x / n_contacts;
+    centroid.y = sum_y / n_contacts;
+
+    if (!peer_ctx->rdpei_gesture_active)
+      {
+        g_message ("rdp: rdpei gesture BEGIN (fingers=%u)", n_contacts);
+        meta_rdp_rdpei_queue_gesture_locked (peer_ctx,
+                                             CLUTTER_TOUCHPAD_GESTURE_PHASE_BEGIN,
+                                             n_contacts, 0.0f, 0.0f);
+        peer_ctx->rdpei_gesture_active = TRUE;
+        peer_ctx->rdpei_gesture_fingers = n_contacts;
+        peer_ctx->rdpei_gesture_prev_centroid = centroid;
+        peer_ctx->rdpei_gesture_pending_streak = 0;
+        peer_ctx->rdpei_gesture_total_dx = 0.0f;
+        peer_ctx->rdpei_gesture_total_dy = 0.0f;
+        return;
+      }
+
+    if (n_contacts != peer_ctx->rdpei_gesture_fingers)
+      {
+        /* Same debounce idea as the low-finger-count case above: a
+         * momentary blip from e.g. 3 to 4 and back to 3 fingers shouldn't
+         * cancel+restart the gesture and reset GNOME Shell's accumulated
+         * progress. While debouncing, keep tracking motion under the
+         * existing (pre-blip) finger count/gesture -- refresh
+         * prev_centroid without emitting a delta for this one frame, so
+         * the eventual resolution (either settling back to the original
+         * count, or a real sustained change) doesn't produce a spurious
+         * jump. */
+        if (peer_ctx->rdpei_gesture_pending_fingers != n_contacts)
+          {
+            peer_ctx->rdpei_gesture_pending_fingers = n_contacts;
+            peer_ctx->rdpei_gesture_pending_streak = 1;
+          }
+        else
+          {
+            peer_ctx->rdpei_gesture_pending_streak++;
+          }
+
+        if (peer_ctx->rdpei_gesture_pending_streak < META_RDP_GESTURE_FINGER_DEBOUNCE)
+          {
+            peer_ctx->rdpei_gesture_prev_centroid = centroid;
+            return;
+          }
+
+        /* Sustained for long enough: this is a real change. Real touchpad
+         * drivers cancel and restart in that case too (see
+         * ClutterTouchpadGesturePhase's doc comment). */
+        g_message ("rdp: rdpei gesture CANCEL+BEGIN: finger count %u -> %u persisted %u frames "
+                   "(total emitted delta before cancel=(%.1f,%.1f))",
+                   peer_ctx->rdpei_gesture_fingers, n_contacts,
+                   peer_ctx->rdpei_gesture_pending_streak,
+                   (double) peer_ctx->rdpei_gesture_total_dx,
+                   (double) peer_ctx->rdpei_gesture_total_dy);
+        meta_rdp_rdpei_queue_gesture_locked (peer_ctx,
+                                             CLUTTER_TOUCHPAD_GESTURE_PHASE_CANCEL,
+                                             peer_ctx->rdpei_gesture_fingers,
+                                             0.0f, 0.0f);
+        meta_rdp_rdpei_queue_gesture_locked (peer_ctx,
+                                             CLUTTER_TOUCHPAD_GESTURE_PHASE_BEGIN,
+                                             n_contacts, 0.0f, 0.0f);
+        peer_ctx->rdpei_gesture_fingers = n_contacts;
+        peer_ctx->rdpei_gesture_prev_centroid = centroid;
+        peer_ctx->rdpei_gesture_pending_streak = 0;
+        peer_ctx->rdpei_gesture_total_dx = 0.0f;
+        peer_ctx->rdpei_gesture_total_dy = 0.0f;
+        return;
+      }
+
+    peer_ctx->rdpei_gesture_pending_streak = 0;
+
+    /* Ongoing gesture, same finger count: emit the incremental delta. */
+    {
+      float dx = (centroid.x - peer_ctx->rdpei_gesture_prev_centroid.x) *
+                 META_RDP_GESTURE_DELTA_SCALE;
+      float dy = (centroid.y - peer_ctx->rdpei_gesture_prev_centroid.y) *
+                 META_RDP_GESTURE_DELTA_SCALE;
+
+      if (dx != 0.0f || dy != 0.0f)
+        {
+          meta_rdp_rdpei_queue_gesture_locked (peer_ctx,
+                                               CLUTTER_TOUCHPAD_GESTURE_PHASE_UPDATE,
+                                               n_contacts, dx, dy);
+          peer_ctx->rdpei_gesture_prev_centroid = centroid;
+          peer_ctx->rdpei_gesture_total_dx += dx;
+          peer_ctx->rdpei_gesture_total_dy += dy;
+        }
+    }
+  }
+}
+
+/* Runs on the rdpei channel's own reader thread (rdpei_server_open() spawns
+ * it, like gfxredir's Open()) -- must not touch Clutter directly. */
+static UINT
+meta_rdp_rdpei_touch_event (RdpeiServerContext          *context,
+                            const RDPINPUT_TOUCH_EVENT  *touch_event)
+{
+  MetaRdpPeerContext *peer_ctx = context->user_data;
+  UINT16 fi;
+
+  g_mutex_lock (&peer_ctx->rdpei_mutex);
+
+  for (fi = 0; fi < touch_event->frameCount; fi++)
+    {
+      const RDPINPUT_TOUCH_FRAME *frame = &touch_event->frames[fi];
+      UINT16 ci;
+
+      for (ci = 0; ci < frame->contactCount; ci++)
+        {
+          const RDPINPUT_CONTACT_DATA *contact = &frame->contacts[ci];
+          gpointer key = GUINT_TO_POINTER (contact->contactId);
+
+          if (contact->contactFlags &
+              (RDPINPUT_CONTACT_FLAG_UP | RDPINPUT_CONTACT_FLAG_CANCELED))
+            {
+              if (g_hash_table_remove (peer_ctx->rdpei_contacts, key))
+                g_message ("rdp: rdpei contact %u up/canceled, %u contact(s) remain",
+                           contact->contactId,
+                           g_hash_table_size (peer_ctx->rdpei_contacts));
+              continue;
+            }
+
+          if (contact->contactFlags &
+              (RDPINPUT_CONTACT_FLAG_DOWN | RDPINPUT_CONTACT_FLAG_UPDATE))
+            {
+              graphene_point_t *p = g_hash_table_lookup (peer_ctx->rdpei_contacts, key);
+
+              if (!p)
+                {
+                  p = g_new (graphene_point_t, 1);
+                  g_hash_table_insert (peer_ctx->rdpei_contacts, key, p);
+                  g_message ("rdp: rdpei contact %u down at (%d,%d), %u contact(s) now active",
+                             contact->contactId, contact->x, contact->y,
+                             g_hash_table_size (peer_ctx->rdpei_contacts));
+                }
+              p->x = (float) contact->x;
+              p->y = (float) contact->y;
+            }
+        }
+
+      /* Evaluate once per frame, not once per event: a touch event can
+       * bundle several frames, each a distinct instant in time. */
+      meta_rdp_rdpei_evaluate_gesture_locked (peer_ctx);
+    }
+
+  g_mutex_unlock (&peer_ctx->rdpei_mutex);
+
+  return CHANNEL_RC_OK;
+}
+
+static UINT
+meta_rdp_rdpei_client_ready (RdpeiServerContext *context)
+{
+  g_message ("rdp: rdpei client ready (version 0x%08x, max touch points %u)",
+             context->clientVersion, context->maxTouchPoints);
+  return CHANNEL_RC_OK;
+}
+
+/* Fires once the background thread has actually opened the WTS channel --
+ * the earliest point at which sending SC_READY (the server-initiated half of
+ * the MS-RDPEI handshake) can succeed. Runs on the rdpei thread, but
+ * rdpei_server_send_sc_ready() is plain channel I/O, not a Clutter call, so
+ * it is fine to call directly from here. */
+static BOOL
+meta_rdp_rdpei_channel_id_assigned (RdpeiServerContext *context,
+                                    UINT32              channel_id)
+{
+  UINT error;
+
+  error = rdpei_server_send_sc_ready (context, RDPINPUT_PROTOCOL_V300, 0);
+  if (error != CHANNEL_RC_OK)
+    {
+      g_warning ("rdp: rdpei send_sc_ready failed with error %u", error);
+      return FALSE;
+    }
+
+  return TRUE;
+}
+
+static void
+meta_rdp_setup_rdpei (MetaRdpPeerContext *peer_ctx)
+{
+  RdpeiServerContext *rdpei;
+
+  if (peer_ctx->rdpei)
+    return;
+
+  rdpei = rdpei_server_context_new (peer_ctx->vcm);
+  if (!rdpei)
+    {
+      g_warning ("rdp: rdpei_server_context_new failed; touch/gesture forwarding disabled");
+      return;
+    }
+
+  rdpei->user_data = peer_ctx;
+  rdpei->onChannelIdAssigned = meta_rdp_rdpei_channel_id_assigned;
+  rdpei->onClientReady = meta_rdp_rdpei_client_ready;
+  rdpei->onTouchEvent = meta_rdp_rdpei_touch_event;
+
+  if (rdpei->Open (rdpei) != CHANNEL_RC_OK)
+    {
+      g_warning ("rdp: rdpei Open failed; touch/gesture forwarding disabled");
+      rdpei_server_context_free (rdpei);
+      return;
+    }
+
+  peer_ctx->rdpei = rdpei;
+  g_message ("rdp: rdpei channel opened");
+}
+
+/* ------------------------------------------------------------------ */
 /* Task 05: input injection (RDP keyboard/mouse -> clutter virtual devices) */
 /* ------------------------------------------------------------------ */
 
@@ -3440,6 +4003,9 @@ meta_rdp_notify_pointer_position (MetaRdpPeerContext *peer_ctx,
                                   UINT16              y)
 {
   float scale = meta_rdp_server_get_scale (peer_ctx->server);
+
+  peer_ctx->last_pointer_x = (float) x / scale;
+  peer_ctx->last_pointer_y = (float) y / scale;
 
   meta_rdp_ensure_virtual_pointer (peer_ctx);
   clutter_virtual_input_device_notify_absolute_motion (peer_ctx->virtual_pointer,
@@ -3907,6 +4473,7 @@ xf_peer_activate (freerdp_peer *client)
     peer_ctx->audio_in = meta_rdp_audio_in_new (peer_ctx->vcm);
 
   meta_rdp_setup_gfxredir (peer_ctx);
+  meta_rdp_setup_rdpei (peer_ctx);
 
   if (peer_ctx->use_gfxredir)
     {
@@ -4041,6 +4608,9 @@ rdp_peer_context_new (freerdp_peer *client, rdpContext *context)
   g_mutex_init (&peer_ctx->gfxredir_mutex);
   g_mutex_init (&peer_ctx->disp_mutex);
   g_mutex_init (&peer_ctx->vcm_drain_mutex);
+  g_mutex_init (&peer_ctx->rdpei_mutex);
+  peer_ctx->rdpei_contacts = g_hash_table_new_full (NULL, NULL, NULL, g_free);
+  peer_ctx->rdpei_pending_gestures = g_queue_new ();
 
   /* Codec fallback encoder. */
   peer_ctx->nsc_context = nsc_context_new ();
@@ -4115,6 +4685,23 @@ rdp_peer_context_free (freerdp_peer *client, rdpContext *context)
   g_mutex_unlock (&peer_ctx->disp_mutex);
   g_mutex_clear (&peer_ctx->disp_mutex);
   g_mutex_clear (&peer_ctx->vcm_drain_mutex);
+
+  if (peer_ctx->rdpei)
+    {
+      /* Same ordering as gfxredir/disp: Close() first so onTouchEvent cannot
+       * be running -- or start running -- once this returns. */
+      peer_ctx->rdpei->Close (peer_ctx->rdpei);
+      rdpei_server_context_free (peer_ctx->rdpei);
+      peer_ctx->rdpei = NULL;
+    }
+
+  g_mutex_lock (&peer_ctx->rdpei_mutex);
+  g_clear_handle_id (&peer_ctx->rdpei_idle_id, g_source_remove);
+  g_mutex_unlock (&peer_ctx->rdpei_mutex);
+  g_mutex_clear (&peer_ctx->rdpei_mutex);
+  g_clear_pointer (&peer_ctx->rdpei_contacts, g_hash_table_unref);
+  g_queue_free_full (peer_ctx->rdpei_pending_gestures,
+                     (GDestroyNotify) meta_rdp_pending_gesture_free);
 
   g_clear_pointer (&peer_ctx->missed_damage, mtk_region_unref);
 
