@@ -51,6 +51,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <linux/vm_sockets.h>
 #include <linux/input.h>
@@ -5487,6 +5488,19 @@ on_context_started (MetaContext   *context,
   g_message ("rdp: RDP server ready, waiting for client");
 }
 
+static gboolean
+meta_rdp_is_mount_point (const char *path)
+{
+  g_autofree char *parent = g_path_get_dirname (path);
+  struct stat st, parent_st;
+
+  if (stat (path, &st) != 0 || !S_ISDIR (st.st_mode) ||
+      stat (parent, &parent_st) != 0)
+    return FALSE;
+
+  return st.st_dev != parent_st.st_dev;
+}
+
 MetaRdpServer *
 meta_rdp_server_new (MetaBackend  *backend,
                      GError      **error)
@@ -5507,7 +5521,17 @@ meta_rdp_server_new (MetaBackend  *backend,
 
   self->shared_memory_mount_path =
     g_strdup (g_getenv ("WSL2_SHARED_MEMORY_MOUNT_POINT"));
-  if (self->shared_memory_mount_path)
+  if (self->shared_memory_mount_path &&
+      !meta_rdp_is_mount_point (self->shared_memory_mount_path))
+    {
+      /* Not every system distro publishes the shared-memory share, and
+       * without it gfxredir would just create files in a plain directory
+       * the client can't see. */
+      g_message ("rdp: %s is not mounted; codec fallback only",
+                 self->shared_memory_mount_path);
+      g_clear_pointer (&self->shared_memory_mount_path, g_free);
+    }
+  else if (self->shared_memory_mount_path)
     g_message ("rdp: shared-memory mount: %s (gfxredir fast path enabled)",
                self->shared_memory_mount_path);
   else
