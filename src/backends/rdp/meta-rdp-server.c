@@ -5100,6 +5100,26 @@ meta_rdp_create_vsock_fd (int port)
   return fd;
 }
 
+static gboolean
+meta_rdp_parse_env_int (const char  *name,
+                        const char  *value,
+                        int          min,
+                        int          max,
+                        int         *out,
+                        GError     **error)
+{
+  gint64 parsed;
+
+  if (!g_ascii_string_to_signed (value, 10, min, max, &parsed, error))
+    {
+      g_prefix_error (error, "%s=%s: ", name, value);
+      return FALSE;
+    }
+
+  *out = (int) parsed;
+  return TRUE;
+}
+
 /*
  * Determine the listening fd for the RDP server, in priority order:
  *   1. MUTTER_RDP_VSOCK_PORT set -> bind our own AF_VSOCK on that port. This is
@@ -5108,61 +5128,75 @@ meta_rdp_create_vsock_fd (int port)
  *   2. USE_VSOCK set to a non-empty value -> an already-listening fd inherited
  *      from WSLGd; use it directly.
  *   3. USE_VSOCK set but empty -> create our own vsock on vsock_port.
- *   4. none of the above -> return -1 (fall back to TCP for local debugging).
+ *   4. none of the above -> *out_fd = -1; the caller only falls back to TCP
+ *      when explicitly asked to (MUTTER_RDP_DEBUG_TCP=1).
+ *
+ * If a vsock was requested but can't be set up, this fails instead of falling
+ * back: the TCP listener has no authentication.
  */
-static int
-meta_rdp_get_listen_fd (MetaRdpServer *self,
-                        int            vsock_port)
+static gboolean
+meta_rdp_get_listen_fd (MetaRdpServer  *self,
+                        int             vsock_port,
+                        int            *out_fd,
+                        GError        **error)
 {
   const char *vsock_port_str = g_getenv ("MUTTER_RDP_VSOCK_PORT");
   const char *fd_str;
   int fd;
 
+  *out_fd = -1;
+
   if (vsock_port_str && *vsock_port_str != '\0')
     {
-      int port = atoi (vsock_port_str);
+      int port;
 
-      if (port <= 0)
-        {
-          g_warning ("rdp: MUTTER_RDP_VSOCK_PORT=%s is not a valid port",
-                     vsock_port_str);
-          return -1;
-        }
+      if (!meta_rdp_parse_env_int ("MUTTER_RDP_VSOCK_PORT", vsock_port_str,
+                                   1, G_MAXINT, &port, error))
+        return FALSE;
 
       fd = meta_rdp_create_vsock_fd (port);
-      if (fd >= 0)
+      if (fd < 0)
         {
-          self->owned_listen_fd = fd;
-          g_message ("rdp: created vsock fd %d on WSLGd-published port %d",
-                     fd, port);
+          g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                       "unable to listen on vsock port %d", port);
+          return FALSE;
         }
-      return fd;
+
+      self->owned_listen_fd = fd;
+      g_message ("rdp: created vsock fd %d on WSLGd-published port %d",
+                 fd, port);
+      *out_fd = fd;
+      return TRUE;
     }
 
   fd_str = g_getenv ("USE_VSOCK");
 
   if (!fd_str)
-    return -1;
+    return TRUE;
 
   if (*fd_str != '\0')
     {
-      fd = atoi (fd_str);
-      if (fd <= 0)
-        {
-          g_warning ("rdp: USE_VSOCK=%s is not a valid fd", fd_str);
-          return -1;
-        }
+      if (!meta_rdp_parse_env_int ("USE_VSOCK", fd_str,
+                                   3, G_MAXINT, &fd, error))
+        return FALSE;
+
       g_message ("rdp: using inherited vsock fd %d from WSLGd", fd);
-      return fd;
+      *out_fd = fd;
+      return TRUE;
     }
 
   fd = meta_rdp_create_vsock_fd (vsock_port);
-  if (fd >= 0)
+  if (fd < 0)
     {
-      self->owned_listen_fd = fd;
-      g_message ("rdp: created vsock fd %d on port %d", fd, vsock_port);
+      g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                   "unable to listen on vsock port %d", vsock_port);
+      return FALSE;
     }
-  return fd;
+
+  self->owned_listen_fd = fd;
+  g_message ("rdp: created vsock fd %d on port %d", fd, vsock_port);
+  *out_fd = fd;
+  return TRUE;
 }
 
 static gboolean
@@ -5173,6 +5207,24 @@ meta_rdp_server_start_listener (MetaRdpServer  *self,
   int vsock_port = 0;
   int tcp_port = META_RDP_DEFAULT_TCP_PORT;
   const char *port_env;
+
+  if (!meta_rdp_get_listen_fd (self, vsock_port, &listen_fd, error))
+    return FALSE;
+
+  if (listen_fd < 0 && g_strcmp0 (g_getenv ("MUTTER_RDP_DEBUG_TCP"), "1") != 0)
+    {
+      g_set_error (error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED,
+                   "no vsock configured (MUTTER_RDP_VSOCK_PORT / USE_VSOCK); "
+                   "set MUTTER_RDP_DEBUG_TCP=1 for an unauthenticated "
+                   "TCP listener on 127.0.0.1");
+      return FALSE;
+    }
+
+  port_env = g_getenv ("MUTTER_RDP_PORT");
+  if (port_env &&
+      !meta_rdp_parse_env_int ("MUTTER_RDP_PORT", port_env,
+                               1, 65535, &tcp_port, error))
+    return FALSE;
 
   if (!meta_rdp_generate_session_tls (self, error))
     return FALSE;
@@ -5188,12 +5240,7 @@ meta_rdp_server_start_listener (MetaRdpServer  *self,
   self->listener->PeerAccepted = rdp_incoming_peer;
   self->listener->param4 = self;
 
-  port_env = g_getenv ("MUTTER_RDP_PORT");
-  if (port_env)
-    tcp_port = atoi (port_env);
-
-  listen_fd = meta_rdp_get_listen_fd (self, vsock_port);
-  if (listen_fd > 0)
+  if (listen_fd >= 0)
     {
       if (!self->listener->OpenFromSocket (self->listener, listen_fd))
         {
@@ -5205,13 +5252,14 @@ meta_rdp_server_start_listener (MetaRdpServer  *self,
     }
   else
     {
-      if (!self->listener->Open (self->listener, "0.0.0.0", tcp_port))
+      if (!self->listener->Open (self->listener, "127.0.0.1", tcp_port))
         {
           g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
                        "unable to bind RDP TCP listener on port %d", tcp_port);
           return FALSE;
         }
-      g_message ("rdp: listening on TCP 0.0.0.0:%d (debug mode)", tcp_port);
+      g_warning ("rdp: listening on unauthenticated TCP 127.0.0.1:%d "
+                 "(MUTTER_RDP_DEBUG_TCP)", tcp_port);
     }
 
   if (!rdp_implant_listener (self, self->listener))
