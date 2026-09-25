@@ -41,6 +41,7 @@
 #include "core/meta-context-private.h"
 #include "meta/meta-backend.h"
 #include "meta/meta-context.h"
+#include "meta/meta-debug.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -553,9 +554,9 @@ meta_rdp_server_get_stage (MetaRdpServer *self)
   return META_STAGE (meta_backend_get_stage (self->backend));
 }
 
-/* HACK: rolling meter for the framebuffer readback, the same shape as
- * exponentially weighted so it tracks recent activity, reported once a
- * second, process-wide statics.
+/* Rolling meter for the framebuffer readback: exponentially weighted so it
+ * tracks recent activity, reported once a second (with
+ * MUTTER_DEBUG=remote-desktop), process-wide statics.
  *
  * This is the number the readback work is aimed at: glReadPixels here is a
  * synchronous GPU->CPU transfer that on d3d12 costs a blit into a staging
@@ -589,9 +590,13 @@ meta_rdp_account_readback (int64_t elapsed_us,
   static double mean_rps = -1.0;
   static double mean_bps = -1.0;
 
-  int64_t now_us = g_get_monotonic_time ();
+  int64_t now_us;
   int64_t elapsed_window_us;
 
+  if (!meta_is_topic_enabled (META_DEBUG_REMOTE_DESKTOP))
+    return;
+
+  now_us = g_get_monotonic_time ();
   window_us += elapsed_us;
   window_fence_us += fence_us;
   window_bytes += bytes;
@@ -632,14 +637,15 @@ meta_rdp_account_readback (int64_t elapsed_us,
   /* The last figure is the share of wall-clock time the main loop spent
    * blocked in glReadPixels; at 60fps anything approaching 100% means the
    * compositor is doing nothing but readback. */
-  g_message ("rdp: readback %.0f us/read (mean %.0f, peak %.0f), "
-             "%.0f us fence (mean %.0f), "
-             "%.1f reads/s (mean %.1f), %.2f MB/s (mean %.2f), %.1f%% of wall",
-             us, mean_us, (double) window_peak_us,
-             fence, mean_fence_us,
-             rps, mean_rps,
-             bps / (1024.0 * 1024.0), mean_bps / (1024.0 * 1024.0),
-             100.0 * (window_us + window_fence_us) / elapsed_window_us);
+  meta_topic (META_DEBUG_REMOTE_DESKTOP,
+              "rdp: readback %.0f us/read (mean %.0f, peak %.0f), "
+              "%.0f us fence (mean %.0f), "
+              "%.1f reads/s (mean %.1f), %.2f MB/s (mean %.2f), %.1f%% of wall",
+              us, mean_us, (double) window_peak_us,
+              fence, mean_fence_us,
+              rps, mean_rps,
+              bps / (1024.0 * 1024.0), mean_bps / (1024.0 * 1024.0),
+              100.0 * (window_us + window_fence_us) / elapsed_window_us);
 
   window_start_us = now_us;
   window_us = 0;
@@ -919,9 +925,13 @@ meta_rdp_account_readback_collect (int64_t  copy_us,
   static double mean_copy_us = -1.0;
   static double mean_latency_us = -1.0;
 
-  int64_t now_us = g_get_monotonic_time ();
+  int64_t now_us;
   int64_t elapsed_us;
 
+  if (!meta_is_topic_enabled (META_DEBUG_REMOTE_DESKTOP))
+    return;
+
+  now_us = g_get_monotonic_time ();
   window_copy_us += copy_us;
   window_latency_us += latency_us;
   window_bytes += bytes;
@@ -953,15 +963,16 @@ meta_rdp_account_readback_collect (int64_t  copy_us,
       mean_latency_us = alpha * latency + (1.0 - alpha) * mean_latency_us;
     }
 
-  g_message ("rdp: collect %.0f us copy (mean %.0f), %.0f us latency "
-             "(mean %.0f), %.1f collects/s, %.2f MB/s, %u blocked, "
-             "%.1f%% of wall",
-             copy, mean_copy_us, latency, mean_latency_us,
-             window_collects * (double) G_USEC_PER_SEC / elapsed_us,
-             window_bytes * (double) G_USEC_PER_SEC / elapsed_us /
-             (1024.0 * 1024.0),
-             window_blocked,
-             100.0 * window_copy_us / elapsed_us);
+  meta_topic (META_DEBUG_REMOTE_DESKTOP,
+              "rdp: collect %.0f us copy (mean %.0f), %.0f us latency "
+              "(mean %.0f), %.1f collects/s, %.2f MB/s, %u blocked, "
+              "%.1f%% of wall",
+              copy, mean_copy_us, latency, mean_latency_us,
+              window_collects * (double) G_USEC_PER_SEC / elapsed_us,
+              window_bytes * (double) G_USEC_PER_SEC / elapsed_us /
+              (1024.0 * 1024.0),
+              window_blocked,
+              100.0 * window_copy_us / elapsed_us);
 
   window_start_us = now_us;
   window_copy_us = 0;
@@ -3409,14 +3420,15 @@ meta_rdp_rdpei_dispatch (gpointer user_data)
        * normalized against for horizontal/vertical touchpad swipes,
        * respectively -- included here so the running sums below can be
        * read directly as an approximate progress percentage. */
-      g_message ("rdp: rdpei -> clutter touchpad-swipe %s fingers=%u delta=(%.1f,%.1f) "
-                 "running=(%.1f,%.1f) [~%.0f%% of 400 horiz, ~%.0f%% of 300 vert]",
-                 meta_rdp_gesture_phase_name (item->phase), item->fingers,
-                 (double) item->dx, (double) item->dy,
-                 (double) peer_ctx->rdpei_gesture_dispatched_dx,
-                 (double) peer_ctx->rdpei_gesture_dispatched_dy,
-                 (double) (peer_ctx->rdpei_gesture_dispatched_dx / 400.0f * 100.0f),
-                 (double) (peer_ctx->rdpei_gesture_dispatched_dy / 300.0f * 100.0f));
+      meta_topic (META_DEBUG_REMOTE_DESKTOP,
+                  "rdp: rdpei -> clutter touchpad-swipe %s fingers=%u delta=(%.1f,%.1f) "
+                  "running=(%.1f,%.1f) [~%.0f%% of 400 horiz, ~%.0f%% of 300 vert]",
+                  meta_rdp_gesture_phase_name (item->phase), item->fingers,
+                  (double) item->dx, (double) item->dy,
+                  (double) peer_ctx->rdpei_gesture_dispatched_dx,
+                  (double) peer_ctx->rdpei_gesture_dispatched_dy,
+                  (double) (peer_ctx->rdpei_gesture_dispatched_dx / 400.0f * 100.0f),
+                  (double) (peer_ctx->rdpei_gesture_dispatched_dy / 300.0f * 100.0f));
 
       event = clutter_event_touchpad_swipe_new (CLUTTER_EVENT_NONE,
                                                 g_get_monotonic_time (),
@@ -3468,11 +3480,12 @@ static void
 meta_rdp_rdpei_end_gesture_locked (MetaRdpPeerContext          *peer_ctx,
                                    ClutterTouchpadGesturePhase  phase)
 {
-  g_message ("rdp: rdpei gesture %s (fingers=%u, total emitted delta=(%.1f,%.1f))",
-             meta_rdp_gesture_phase_name (phase),
-             peer_ctx->rdpei_gesture_fingers,
-             (double) peer_ctx->rdpei_gesture_total_dx,
-             (double) peer_ctx->rdpei_gesture_total_dy);
+  meta_topic (META_DEBUG_REMOTE_DESKTOP,
+              "rdp: rdpei gesture %s (fingers=%u, total emitted delta=(%.1f,%.1f))",
+              meta_rdp_gesture_phase_name (phase),
+              peer_ctx->rdpei_gesture_fingers,
+              (double) peer_ctx->rdpei_gesture_total_dx,
+              (double) peer_ctx->rdpei_gesture_total_dy);
   meta_rdp_rdpei_queue_gesture_locked (peer_ctx, phase,
                                        peer_ctx->rdpei_gesture_fingers,
                                        0.0f, 0.0f);
@@ -3591,7 +3604,8 @@ meta_rdp_rdpei_evaluate_gesture_locked (MetaRdpPeerContext *peer_ctx)
 
     if (!peer_ctx->rdpei_gesture_active)
       {
-        g_message ("rdp: rdpei gesture BEGIN (fingers=%u)", n_contacts);
+        meta_topic (META_DEBUG_REMOTE_DESKTOP,
+                    "rdp: rdpei gesture BEGIN (fingers=%u)", n_contacts);
         meta_rdp_rdpei_queue_gesture_locked (peer_ctx,
                                              CLUTTER_TOUCHPAD_GESTURE_PHASE_BEGIN,
                                              n_contacts, 0.0f, 0.0f);
@@ -3643,12 +3657,13 @@ meta_rdp_rdpei_evaluate_gesture_locked (MetaRdpPeerContext *peer_ctx)
         /* Sustained for long enough: this is a real change. Real touchpad
          * drivers cancel and restart in that case too (see
          * ClutterTouchpadGesturePhase's doc comment). */
-        g_message ("rdp: rdpei gesture CANCEL+BEGIN: finger count %u -> %u persisted %u frames "
-                   "(total emitted delta before cancel=(%.1f,%.1f))",
-                   peer_ctx->rdpei_gesture_fingers, n_contacts,
-                   peer_ctx->rdpei_gesture_pending_streak,
-                   (double) peer_ctx->rdpei_gesture_total_dx,
-                   (double) peer_ctx->rdpei_gesture_total_dy);
+        meta_topic (META_DEBUG_REMOTE_DESKTOP,
+                    "rdp: rdpei gesture CANCEL+BEGIN: finger count %u -> %u persisted %u frames "
+                    "(total emitted delta before cancel=(%.1f,%.1f))",
+                    peer_ctx->rdpei_gesture_fingers, n_contacts,
+                    peer_ctx->rdpei_gesture_pending_streak,
+                    (double) peer_ctx->rdpei_gesture_total_dx,
+                    (double) peer_ctx->rdpei_gesture_total_dy);
         meta_rdp_rdpei_queue_gesture_locked (peer_ctx,
                                              CLUTTER_TOUCHPAD_GESTURE_PHASE_CANCEL,
                                              peer_ctx->rdpei_gesture_fingers,
@@ -3725,9 +3740,10 @@ meta_rdp_rdpei_touch_event (RdpeiServerContext          *context,
               (RDPINPUT_CONTACT_FLAG_UP | RDPINPUT_CONTACT_FLAG_CANCELED))
             {
               if (g_hash_table_remove (peer_ctx->rdpei_contacts, key))
-                g_message ("rdp: rdpei contact %u up/canceled, %u contact(s) remain",
-                           contact->contactId,
-                           g_hash_table_size (peer_ctx->rdpei_contacts));
+                meta_topic (META_DEBUG_REMOTE_DESKTOP,
+                            "rdp: rdpei contact %u up/canceled, %u contact(s) remain",
+                            contact->contactId,
+                            g_hash_table_size (peer_ctx->rdpei_contacts));
               continue;
             }
 
@@ -3740,9 +3756,10 @@ meta_rdp_rdpei_touch_event (RdpeiServerContext          *context,
                 {
                   p = g_new (graphene_point_t, 1);
                   g_hash_table_insert (peer_ctx->rdpei_contacts, key, p);
-                  g_message ("rdp: rdpei contact %u down at (%d,%d), %u contact(s) now active",
-                             contact->contactId, contact->x, contact->y,
-                             g_hash_table_size (peer_ctx->rdpei_contacts));
+                  meta_topic (META_DEBUG_REMOTE_DESKTOP,
+                              "rdp: rdpei contact %u down at (%d,%d), %u contact(s) now active",
+                              contact->contactId, contact->x, contact->y,
+                              g_hash_table_size (peer_ctx->rdpei_contacts));
                 }
               p->x = (float) contact->x;
               p->y = (float) contact->y;
