@@ -3,17 +3,17 @@
  *
  * In-process RDP/VAIL output backend for mutter (WSLg).
  *
- * Task 03: stand up an in-process FreeRDP listener + peer, complete activation,
- * and integrate FreeRDP's file descriptors with mutter's GLib main loop. No
- * pixels are pushed yet (that lands in task 04) -- this proves out a live RDP
- * session: the WSLGd-launched client (msrdc) connects over the inherited vsock,
- * negotiates TLS, activates, and the session stays up. Screen stays black.
+ * An in-process FreeRDP 3 server listening on vsock. It presents the
+ * composited desktop through gfxredir shared memory (or raw SURFACE_BITS as
+ * a fallback), and bridges input, the clipboard (CLIPRDR), display control
+ * (DISP), touchpad gestures (RDPEI) and audio (rdpsnd/audin, see
+ * meta-rdp-audio.c).
  *
- * Ported (with RAIL/audio/clipboard stripped) from
- * wslg/weston/libweston/backend-rdp/rdp.c, and since migrated to the upstream
- * FreeRDP 3.x server API. Weston's wl_event_loop fd wiring is replaced with GSources
- * attached to mutter's default GMainContext; everything runs single-threaded on
- * mutter's main thread.
+ * Originally ported from wslg/weston/libweston/backend-rdp/rdp.c (minus
+ * RAIL). Weston's wl_event_loop fd wiring is replaced with GSources attached
+ * to mutter's default GMainContext; the peer is driven from mutter's main
+ * thread, while the gfxredir, disp, rdpei and audio channels run their own
+ * threads and hand work back to the main loop.
  */
 
 #include "config.h"
@@ -58,7 +58,6 @@
 #include <glib/gstdio.h>
 
 #include <freerdp/freerdp.h>
-#include <freerdp/codec/nsc.h>
 #include <freerdp/crypto/certificate.h>
 #include <freerdp/crypto/privatekey.h>
 #include <freerdp/update.h>
@@ -155,7 +154,7 @@ typedef struct _MetaRdpPeerContext
 
   gboolean activated;
 
-  /* Task 05: input injection via clutter virtual devices. */
+  /* input injection via clutter virtual devices. */
   ClutterVirtualInputDevice *virtual_pointer;
   ClutterVirtualInputDevice *virtual_keyboard;
 
@@ -180,10 +179,6 @@ typedef struct _MetaRdpPeerContext
   int vertical_accum_wheel_discrete;
   int horizontal_accum_wheel_precise;
   int horizontal_accum_wheel_discrete;
-
-  /* Fallback (codec) present path: NSCodec / raw over the wire. */
-  NSC_CONTEXT *nsc_context;
-  wStream *encode_stream;
 
   /* Dynamic virtual channel manager, driven to DRDYNVC_STATE_READY before
    * opening DVCs such as gfxredir. */
@@ -545,7 +540,7 @@ meta_rdp_server_resize_monitor (MetaRdpServer *self,
 }
 
 /* ------------------------------------------------------------------ */
-/* Task 04: pixel readback + present (gfxredir fast path / codec fallback) */
+/* pixel readback + present (gfxredir fast path / codec fallback) */
 /* ------------------------------------------------------------------ */
 
 static MetaStage *
@@ -983,9 +978,9 @@ meta_rdp_account_readback_collect (int64_t  copy_us,
 }
 
 /* Read the @width x @height region at (@x, @y) of @framebuffer into @dest
- * (ARGB8888, i.e. BGRA byte order in memory, which is what NSCodec's
- * PIXEL_FORMAT_BGRA32, gfxredir's ARGB_8888 and an uncompressed SURFACE_BITS
- * bitmap all expect on little-endian).
+ * (ARGB8888, i.e. BGRA byte order in memory, which is what gfxredir's
+ * ARGB_8888 and an uncompressed SURFACE_BITS bitmap both expect on
+ * little-endian).
  *
  * Reading only the damaged region matters: this is a synchronous GPU->CPU
  * transfer that stalls the pipeline, and a full 1920x1080 frame is ~8MB even
@@ -2795,7 +2790,7 @@ on_monitors_changed (MetaMonitorManager *monitor_manager,
 }
 
 /* ------------------------------------------------------------------ */
-/* Task 03: FreeRDP fd <-> GLib main loop bridge                      */
+/* FreeRDP fd <-> GLib main loop bridge                               */
 /* ------------------------------------------------------------------ */
 
 typedef gboolean (*MetaRdpFdCheck) (gpointer data);
@@ -2867,7 +2862,7 @@ meta_rdp_add_fd_source (int             fd,
 }
 
 /* ------------------------------------------------------------------ */
-/* Task 03: peer context + callbacks                                  */
+/* peer context + callbacks                                           */
 /* ------------------------------------------------------------------ */
 
 static void
@@ -2980,9 +2975,8 @@ gfxredir_caps_advertise (GfxRedirServerContext              *context,
                  confirm.version, confirm.length);
       context->GraphicsRedirectionCapsConfirm (context, &confirm);
 
-      /* Set atomically, not under gfxredir_mutex: meta_rdp_setup_gfxredir()
-       * spin-waits on this from the main thread, so it has to become visible
-       * without waiting for the idle below to run. */
+      /* Set atomically, not under gfxredir_mutex: the main thread's present
+       * path reads it without taking the lock. */
       g_atomic_int_set (&peer_ctx->gfxredir_activated, TRUE);
       g_message ("rdp: gfxredir activated (caps v0x%x)", selected->version);
 
@@ -3837,7 +3831,7 @@ meta_rdp_setup_rdpei (MetaRdpPeerContext *peer_ctx)
 }
 
 /* ------------------------------------------------------------------ */
-/* Task 05: input injection (RDP keyboard/mouse -> clutter virtual devices) */
+/* input injection (RDP keyboard/mouse -> clutter virtual devices) */
 /* ------------------------------------------------------------------ */
 
 /* Locally define missing keyboard layout IDs in FreeRDP 2.x, as Weston does. */
@@ -4629,8 +4623,7 @@ meta_rdp_peer_finish_activation (freerdp_peer *client)
   /* The client has no pointer shape until we send one. */
   meta_rdp_peer_update_pointer (peer_ctx);
 
-  /* Before gfxredir: its handshake busy-pumps the peer, which flushes the
-   * caps PDU we queue here (Weston opens disp first for the same reason). */
+  /* Before gfxredir, as Weston does. */
   meta_rdp_setup_disp (peer_ctx);
 
   if (!peer_ctx->audio_out)
@@ -4684,7 +4677,7 @@ meta_rdp_peer_flush_channels (gpointer user_data)
 }
 
 static gboolean
-rdp_client_activity_inner (gpointer data)
+rdp_client_activity (gpointer data)
 {
   freerdp_peer *client = data;
   MetaRdpPeerContext *peer_ctx = (MetaRdpPeerContext *) client->context;
@@ -4753,17 +4746,6 @@ out_clean:
   return FALSE;
 }
 
-/* Timing wrapper. Everything above runs on mutter's main loop, so the figure
- * this reports is time the compositor spends servicing the RDP socket instead
- * of painting -- the input to deciding whether the peer belongs on its own
- * thread. Kept as a wrapper so the measurement cannot drift away from the work
- * if the body grows another early return. */
-static gboolean
-rdp_client_activity (gpointer data)
-{
-  return rdp_client_activity_inner (data);
-}
-
 static BOOL
 rdp_peer_context_new (freerdp_peer *client, rdpContext *context)
 {
@@ -4779,15 +4761,6 @@ rdp_peer_context_new (freerdp_peer *client, rdpContext *context)
   g_mutex_init (&peer_ctx->rdpei_mutex);
   peer_ctx->rdpei_contacts = g_hash_table_new_full (NULL, NULL, NULL, g_free);
   peer_ctx->rdpei_pending_gestures = g_queue_new ();
-
-  /* Codec fallback encoder. */
-  peer_ctx->nsc_context = nsc_context_new ();
-  if (peer_ctx->nsc_context)
-    {
-      nsc_context_set_parameters (peer_ctx->nsc_context, NSC_COLOR_FORMAT,
-                                  PIXEL_FORMAT_BGRA32);
-      peer_ctx->encode_stream = Stream_New (NULL, 65536);
-    }
 
   peer_ctx->shm_fd = -1;
   /* -1, not 0: 0 is a valid buffer index, and meta_rdp_acquire_buffer() checks
@@ -4894,16 +4867,6 @@ rdp_peer_context_free (freerdp_peer *client, rdpContext *context)
       peer_ctx->drdynvc = NULL;
     }
 
-  if (peer_ctx->encode_stream)
-    {
-      Stream_Free (peer_ctx->encode_stream, TRUE);
-      peer_ctx->encode_stream = NULL;
-    }
-  if (peer_ctx->nsc_context)
-    {
-      nsc_context_free (peer_ctx->nsc_context);
-      peer_ctx->nsc_context = NULL;
-    }
 
   if (peer_ctx->vcm)
     {
@@ -5037,7 +5000,7 @@ rdp_peer_init (freerdp_peer *client, MetaRdpServer *self)
   client->Activate = xf_peer_activate;
   client->AdjustMonitorsLayout = xf_peer_adjust_monitor_layout;
 
-  /* Task 05: route RDP keyboard/mouse into mutter's virtual input devices. */
+  /* route RDP keyboard/mouse into mutter's virtual input devices. */
   input = client->context->input;
   input->SynchronizeEvent = meta_rdp_synchronize_event;
   input->MouseEvent = meta_rdp_mouse_event;
