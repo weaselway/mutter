@@ -256,6 +256,11 @@ typedef struct _MetaRdpPeerContext
   /* MetaRdpPendingGesture* queued by onTouchEvent, drained and emitted by
    * meta_rdp_rdpei_dispatch() on the main loop. */
   GQueue *rdpei_pending_gestures;
+  /* Ends a gesture whose touch frames stopped arriving (client gone quiet,
+   * lost focus, dropped the lifts). Armed while a gesture is active; see
+   * meta_rdp_rdpei_timeout(). */
+  guint rdpei_timeout_id;
+  gint64 rdpei_last_frame_us;
 
   /* Last pointer position we told Clutter about (meta_rdp_notify_pointer_position),
    * in the same scaled Clutter coordinate space as ClutterEvent.coords. Mouse
@@ -3297,6 +3302,11 @@ meta_rdp_setup_gfxredir (MetaRdpPeerContext *peer_ctx)
  * rdpei_gesture_low_streak/rdpei_gesture_pending_* field comments. */
 #define META_RDP_GESTURE_FINGER_DEBOUNCE 3
 
+/* A gesture that receives no touch frame for this long is ended. The
+ * debounce above needs further frames to confirm a lift, and a client that
+ * stops sending (focus loss, a dropped lift) never sends them. */
+#define META_RDP_GESTURE_TIMEOUT_MS 200
+
 /* Deliberately *not* done here: direction/axis locking, i.e. deciding a
  * swipe is horizontal or vertical and zeroing the other component. GNOME
  * Shell's TouchpadSwipeGesture (js/ui/swipeTracker.js) already does it, and
@@ -3478,6 +3488,56 @@ meta_rdp_rdpei_queue_gesture_locked (MetaRdpPeerContext          *peer_ctx,
                        peer_ctx, NULL);
 }
 
+/* Call with rdpei_mutex held. */
+static void
+meta_rdp_rdpei_end_gesture_locked (MetaRdpPeerContext          *peer_ctx,
+                                   ClutterTouchpadGesturePhase  phase)
+{
+  g_message ("rdp: rdpei gesture %s (fingers=%u, total emitted delta=(%.1f,%.1f))",
+             meta_rdp_gesture_phase_name (phase),
+             peer_ctx->rdpei_gesture_fingers,
+             (double) peer_ctx->rdpei_gesture_total_dx,
+             (double) peer_ctx->rdpei_gesture_total_dy);
+  meta_rdp_rdpei_queue_gesture_locked (peer_ctx, phase,
+                                       peer_ctx->rdpei_gesture_fingers,
+                                       0.0f, 0.0f);
+  peer_ctx->rdpei_gesture_active = FALSE;
+  peer_ctx->rdpei_gesture_low_streak = 0;
+  peer_ctx->rdpei_gesture_pending_streak = 0;
+}
+
+/* Main loop. Ends the gesture once touch frames have stopped for
+ * META_RDP_GESTURE_TIMEOUT_MS; the contacts are forgotten too, so a client
+ * that resumes starts a fresh gesture. */
+static gboolean
+meta_rdp_rdpei_timeout (gpointer user_data)
+{
+  MetaRdpPeerContext *peer_ctx = user_data;
+  gboolean keep = G_SOURCE_CONTINUE;
+
+  g_mutex_lock (&peer_ctx->rdpei_mutex);
+
+  if (!peer_ctx->rdpei_gesture_active)
+    {
+      keep = G_SOURCE_REMOVE;
+    }
+  else if (g_get_monotonic_time () - peer_ctx->rdpei_last_frame_us >=
+           META_RDP_GESTURE_TIMEOUT_MS * G_TIME_SPAN_MILLISECOND)
+    {
+      meta_rdp_rdpei_end_gesture_locked (peer_ctx,
+                                         CLUTTER_TOUCHPAD_GESTURE_PHASE_END);
+      g_hash_table_remove_all (peer_ctx->rdpei_contacts);
+      keep = G_SOURCE_REMOVE;
+    }
+
+  if (keep == G_SOURCE_REMOVE)
+    peer_ctx->rdpei_timeout_id = 0;
+
+  g_mutex_unlock (&peer_ctx->rdpei_mutex);
+
+  return keep;
+}
+
 /* Call with rdpei_mutex held. Re-evaluates gesture state against the
  * currently-tracked contacts after onTouchEvent has updated them for one
  * frame, queuing whatever ClutterEvent(s) that transition implies. */
@@ -3493,9 +3553,12 @@ meta_rdp_rdpei_evaluate_gesture_locked (MetaRdpPeerContext *peer_ctx)
 
       /* Debounce: don't tear the gesture down over what might be a single
        * transient HID under-report (e.g. one finger of a staggered
-       * release lifting slightly before the others). */
+       * release lifting slightly before the others). With no contact left
+       * at all it is a real release, and the client won't send the frames
+       * the debounce would wait for. */
       peer_ctx->rdpei_gesture_low_streak++;
-      if (peer_ctx->rdpei_gesture_low_streak < META_RDP_GESTURE_FINGER_DEBOUNCE)
+      if (n_contacts > 0 &&
+          peer_ctx->rdpei_gesture_low_streak < META_RDP_GESTURE_FINGER_DEBOUNCE)
         {
           /* Refresh prev_centroid from whatever contacts remain (if any)
            * so that if the count recovers, the next delta is computed
@@ -3527,16 +3590,8 @@ meta_rdp_rdpei_evaluate_gesture_locked (MetaRdpPeerContext *peer_ctx)
           return;
         }
 
-      g_message ("rdp: rdpei gesture END (fingers=%u, total emitted delta=(%.1f,%.1f))",
-                 peer_ctx->rdpei_gesture_fingers,
-                 (double) peer_ctx->rdpei_gesture_total_dx,
-                 (double) peer_ctx->rdpei_gesture_total_dy);
-      meta_rdp_rdpei_queue_gesture_locked (peer_ctx,
-                                           CLUTTER_TOUCHPAD_GESTURE_PHASE_END,
-                                           peer_ctx->rdpei_gesture_fingers,
-                                           0.0f, 0.0f);
-      peer_ctx->rdpei_gesture_active = FALSE;
-      peer_ctx->rdpei_gesture_low_streak = 0;
+      meta_rdp_rdpei_end_gesture_locked (peer_ctx,
+                                         CLUTTER_TOUCHPAD_GESTURE_PHASE_END);
       return;
     }
 
@@ -3571,6 +3626,15 @@ meta_rdp_rdpei_evaluate_gesture_locked (MetaRdpPeerContext *peer_ctx)
         peer_ctx->rdpei_gesture_pending_streak = 0;
         peer_ctx->rdpei_gesture_total_dx = 0.0f;
         peer_ctx->rdpei_gesture_total_dy = 0.0f;
+
+        /* g_timeout_add() attaches to the default main context, which is
+         * safe from this (the rdpei) thread. */
+        if (!peer_ctx->rdpei_timeout_id)
+          {
+            peer_ctx->rdpei_timeout_id =
+              g_timeout_add (META_RDP_GESTURE_TIMEOUT_MS / 2,
+                             meta_rdp_rdpei_timeout, peer_ctx);
+          }
         return;
       }
 
@@ -3657,6 +3721,8 @@ meta_rdp_rdpei_touch_event (RdpeiServerContext          *context,
   UINT16 fi;
 
   g_mutex_lock (&peer_ctx->rdpei_mutex);
+
+  peer_ctx->rdpei_last_frame_us = g_get_monotonic_time ();
 
   for (fi = 0; fi < touch_event->frameCount; fi++)
     {
@@ -4704,9 +4770,21 @@ rdp_peer_context_free (freerdp_peer *client, rdpContext *context)
       peer_ctx->rdpei = NULL;
     }
 
+  /* Don't leave Shell in the middle of a swipe: flush whatever is still
+   * queued (possibly the END) right now, and cancel a gesture that is
+   * still going. We're on the main loop, so dispatch directly. */
   g_mutex_lock (&peer_ctx->rdpei_mutex);
   g_clear_handle_id (&peer_ctx->rdpei_idle_id, g_source_remove);
+  g_clear_handle_id (&peer_ctx->rdpei_timeout_id, g_source_remove);
+  if (peer_ctx->rdpei_gesture_active)
+    {
+      meta_rdp_rdpei_end_gesture_locked (peer_ctx,
+                                         CLUTTER_TOUCHPAD_GESTURE_PHASE_CANCEL);
+      g_clear_handle_id (&peer_ctx->rdpei_idle_id, g_source_remove);
+    }
   g_mutex_unlock (&peer_ctx->rdpei_mutex);
+  if (!g_queue_is_empty (peer_ctx->rdpei_pending_gestures))
+    meta_rdp_rdpei_dispatch (peer_ctx);
   g_mutex_clear (&peer_ctx->rdpei_mutex);
   g_clear_pointer (&peer_ctx->rdpei_contacts, g_hash_table_unref);
   g_queue_free_full (peer_ctx->rdpei_pending_gestures,
