@@ -2933,6 +2933,10 @@ gfxredir_caps_advertise (GfxRedirServerContext              *context,
     {
       if (current->signature != GFXREDIR_CAPS_SIGNATURE)
         return ERROR_INVALID_DATA;
+      /* A zero length would loop forever on the channel thread. */
+      if (current->length < sizeof (GFXREDIR_CAPS_HEADER) ||
+          current->length > length)
+        return ERROR_INVALID_DATA;
       if (current->version >= selected_version)
         {
           selected = current;
