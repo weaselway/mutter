@@ -29,6 +29,27 @@
 #include "meta/meta-monitor-manager.h"
 #include "meta/util.h"
 
+/* With the RDP server running (MUTTER_RDP, see meta_rdp_server_new()) the
+ * pointer is drawn by the remote client rather than composited into the
+ * frame. Disabling the cursor overlays keeps the sprite out of the captured
+ * framebuffer and, more importantly, stops pointer motion from queueing stage
+ * redraws that would otherwise cost a full RDP frame per motion event with
+ * nothing visibly changing. Everything else keeps its cursor. */
+static gboolean
+meta_stage_cursor_overlays_disabled (void)
+{
+#ifdef HAVE_RDP
+  static int disabled = -1;
+
+  if (disabled < 0)
+    disabled = g_getenv ("MUTTER_RDP") != NULL;
+
+  return disabled;
+#else
+  return FALSE;
+#endif
+}
+
 struct _MetaStageWatch
 {
   ClutterStageView *view;
@@ -164,6 +185,7 @@ meta_overlay_paint (MetaOverlay         *overlay,
     view_state = ensure_view_state (overlay, view);
 
   should_paint_any =
+    !meta_stage_cursor_overlays_disabled () &&
     !(clutter_paint_context_get_paint_flags (paint_context) &
       CLUTTER_PAINT_FLAG_NO_CURSORS);
   if (should_paint_any)
@@ -416,6 +438,10 @@ queue_redraw_for_cursor_overlay (MetaStage   *stage,
                                  MetaOverlay *overlay)
 {
   GList *l;
+
+  /* Nothing paints the overlay, so nothing needs repainting when it moves. */
+  if (meta_stage_cursor_overlays_disabled ())
+    return;
 
   for (l = clutter_stage_peek_stage_views (CLUTTER_STAGE (stage));
        l;
