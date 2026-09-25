@@ -4328,6 +4328,10 @@ meta_rdp_keyboard_event (rdpInput *input,
 
   scan_code = GetKeycodeFromVirtualKeyCode (vk_code, WINPR_KEYCODE_TYPE_XKB);
 
+  /* 0 for keys WinPR can't map; anything below 8 would wrap around below. */
+  if (scan_code < 8)
+    return TRUE;
+
   meta_rdp_ensure_virtual_keyboard (peer_ctx);
 
   /* clutter/evdev keycodes are xkb keycodes minus 8. */
