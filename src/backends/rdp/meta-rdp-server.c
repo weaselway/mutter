@@ -3290,11 +3290,17 @@ meta_rdp_setup_gfxredir (MetaRdpPeerContext *peer_ctx)
  * SwipeTracker's VELOCITY_THRESHOLD_TOUCHPAD it snaps to whichever endpoint
  * accumulated *progress* is closer to; above that it projects from
  * velocity instead -- so this only needs to get the total travel roughly
- * right, not pixel-perfect. Tune alongside the client's kGestureScale if
- * gestures still need too much or too little travel, or overshoot/never
- * commit -- this also depends on window pixel size, since the source
- * coordinates are session pixels, not touchpad-physical units. */
+ * right, not pixel-perfect.
+ *
+ * The client maps touchpad travel to a fraction of its window and scales it
+ * by kGestureScale; the contact coordinates we get are that fraction in
+ * session pixels. Normalize by the desktop size first so the result is
+ * touchpad travel again, independent of resolution, then scale it as tuned
+ * on a 1920x1080 session (0.5 per pixel there). Tune this, not the client's
+ * kGestureScale, if gestures need too much or too little travel. */
 #define META_RDP_GESTURE_DELTA_SCALE 0.5f
+#define META_RDP_GESTURE_REFERENCE_WIDTH 1920.0f
+#define META_RDP_GESTURE_REFERENCE_HEIGHT 1080.0f
 
 /* How many consecutive onTouchEvent frames a finger-count change (including
  * dropping below META_RDP_GESTURE_MIN_FINGERS) must persist before it's
@@ -3693,10 +3699,22 @@ meta_rdp_rdpei_evaluate_gesture_locked (MetaRdpPeerContext *peer_ctx)
 
     /* Ongoing gesture, same finger count: emit the incremental delta. */
     {
-      float dx = (centroid.x - peer_ctx->rdpei_gesture_prev_centroid.x) *
-                 META_RDP_GESTURE_DELTA_SCALE;
-      float dy = (centroid.y - peer_ctx->rdpei_gesture_prev_centroid.y) *
-                 META_RDP_GESTURE_DELTA_SCALE;
+      rdpSettings *settings = peer_ctx->rdp_context.settings;
+      float width = (float) freerdp_settings_get_uint32 (settings,
+                                                         FreeRDP_DesktopWidth);
+      float height = (float) freerdp_settings_get_uint32 (settings,
+                                                          FreeRDP_DesktopHeight);
+      float dx, dy;
+
+      if (width <= 0.0f)
+        width = META_RDP_GESTURE_REFERENCE_WIDTH;
+      if (height <= 0.0f)
+        height = META_RDP_GESTURE_REFERENCE_HEIGHT;
+
+      dx = (centroid.x - peer_ctx->rdpei_gesture_prev_centroid.x) / width *
+           META_RDP_GESTURE_REFERENCE_WIDTH * META_RDP_GESTURE_DELTA_SCALE;
+      dy = (centroid.y - peer_ctx->rdpei_gesture_prev_centroid.y) / height *
+           META_RDP_GESTURE_REFERENCE_HEIGHT * META_RDP_GESTURE_DELTA_SCALE;
 
       if (dx != 0.0f || dy != 0.0f)
         {
