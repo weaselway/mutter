@@ -54,6 +54,8 @@
 #include <linux/vm_sockets.h>
 #include <linux/input.h>
 
+#include <glib/gstdio.h>
+
 #include <freerdp/freerdp.h>
 #include <freerdp/codec/nsc.h>
 #include <freerdp/crypto/certificate.h>
@@ -5109,6 +5111,33 @@ rdp_implant_listener (MetaRdpServer    *self,
   return TRUE;
 }
 
+/* The directory holds the session's private key, so don't leave it behind.
+ * winpr-makecert writes a few files besides the two we use. */
+static void
+meta_rdp_remove_cert_dir (MetaRdpServer *self)
+{
+  g_autoptr (GDir) dir = NULL;
+  const char *name;
+
+  if (!self->cert_dir)
+    return;
+
+  dir = g_dir_open (self->cert_dir, 0, NULL);
+  if (dir)
+    {
+      while ((name = g_dir_read_name (dir)))
+        {
+          g_autofree char *path = g_build_filename (self->cert_dir, name, NULL);
+
+          if (g_unlink (path) != 0)
+            g_warning ("rdp: failed to remove %s: %s", path, g_strerror (errno));
+        }
+    }
+
+  if (g_rmdir (self->cert_dir) != 0 && errno != ENOENT)
+    g_warning ("rdp: failed to remove %s: %s", self->cert_dir, g_strerror (errno));
+}
+
 static gboolean
 meta_rdp_generate_session_tls (MetaRdpServer  *self,
                                GError        **error)
@@ -5506,6 +5535,7 @@ meta_rdp_server_dispose (GObject *object)
       self->owned_listen_fd = -1;
     }
 
+  meta_rdp_remove_cert_dir (self);
   g_clear_pointer (&self->cert_file, g_free);
   g_clear_pointer (&self->key_file, g_free);
   g_clear_pointer (&self->cert_dir, g_free);
