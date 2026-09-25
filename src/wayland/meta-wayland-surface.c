@@ -347,6 +347,10 @@ meta_wayland_log_buffer_damage (MetaWaylandSurface *surface,
   int64_t full_area;
   gboolean covers_full_level = FALSE;
 
+  /* Runs on every commit; don't do the work unless it gets logged. */
+  if (!meta_is_topic_enabled (META_DEBUG_WAYLAND))
+    return;
+
   n_rectangles = mtk_region_num_rectangles (buffer_region);
   if (n_rectangles == 0)
     return;
