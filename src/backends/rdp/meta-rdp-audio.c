@@ -38,6 +38,7 @@
 #include <poll.h>
 #include <string.h>
 #include <sys/eventfd.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -240,6 +241,14 @@ rdp_audio_connect (const char     *env_var,
  * wraparound range of RdpsndServerContext::block_no. */
 #define MAX_BLOCKS_IN_FLIGHT 256
 
+/* How much audio may be queued between PipeWire and the client. Clients
+ * confirm a block as soon as it arrives, not when it has played, so the
+ * in-flight limit alone doesn't bound latency: after any stall the backlog
+ * in the sink socket was forwarded in one burst and the client played it
+ * out seconds late. Cap both the in-flight blocks and the socket backlog to
+ * this, dropping the oldest audio to catch up. */
+#define AUDIO_MAX_BUFFERED_MS 150
+
 typedef struct
 {
   /* Submitted to rdpsnd and not yet given back. Confirms for a block that was
@@ -270,6 +279,10 @@ struct _MetaRdpAudioOut
   gboolean send_silence;
   guint8 *buffer;
   size_t buffer_size;
+
+  /* AUDIO_MAX_BUFFERED_MS expressed in blocks and in sink socket bytes. */
+  int max_in_flight;
+  size_t max_backlog_bytes;
 
   MetaRdpAudioBlockInfo block_info[MAX_BLOCKS_IN_FLIGHT];
 
@@ -360,7 +373,7 @@ rdp_audio_block_sem_reset (MetaRdpAudioOut *audio_out)
   while (read (audio_out->block_sem, &dummy, sizeof (dummy)) == sizeof (dummy))
     ;
 
-  for (i = 0; i < MAX_BLOCKS_IN_FLIGHT; i++)
+  for (i = 0; i < audio_out->max_in_flight; i++)
     {
       if (!rdp_audio_block_sem_release (audio_out))
         break;
@@ -406,12 +419,48 @@ on_rdpsnd_confirm_block (RdpsndServerContext *context,
  *
  * Returns FALSE when the connection is gone or teardown was signalled; the
  * caller reconnects or exits. */
+/* Drop the oldest audio queued in the sink socket beyond
+ * max_backlog_bytes, in whole frames. See AUDIO_MAX_BUFFERED_MS. */
+static void
+rdp_audio_out_skip_backlog (MetaRdpAudioOut *audio_out)
+{
+  size_t excess;
+  int available = 0;
+
+  if (ioctl (audio_out->sink_fd, FIONREAD, &available) != 0 ||
+      (size_t) available <= audio_out->max_backlog_bytes)
+    return;
+
+  excess = (size_t) available - audio_out->max_backlog_bytes;
+  excess -= excess % audio_out->bytes_per_frame;
+
+  g_debug ("rdp: audio: dropping %zu bytes (%zu ms) of backlog",
+           excess,
+           excess / audio_out->bytes_per_frame * 1000 /
+           rdp_audio_out_format.nSamplesPerSec);
+
+  while (excess > 0)
+    {
+      ssize_t n = read (audio_out->sink_fd, audio_out->buffer,
+                        MIN (excess, audio_out->buffer_size));
+
+      if (n < 0 && errno == EINTR)
+        continue;
+      if (n <= 0)
+        return; /* the next read reports it */
+
+      excess -= n;
+    }
+}
+
 static gboolean
 rdp_audio_out_forward_packet (MetaRdpAudioOut *audio_out)
 {
   size_t chunk = audio_out->buffer_size;
   size_t got = 0;
   BYTE block_no;
+
+  rdp_audio_out_skip_backlog (audio_out);
 
   while (got < chunk)
     {
@@ -598,6 +647,12 @@ on_rdpsnd_activated (RdpsndServerContext *context)
   audio_out->buffer_size =
     audio_out->frames_per_packet * (size_t) audio_out->bytes_per_frame;
   audio_out->buffer = g_malloc0 (audio_out->buffer_size);
+
+  audio_out->max_in_flight = CLAMP (AUDIO_MAX_BUFFERED_MS / latency_ms,
+                                    2, MAX_BLOCKS_IN_FLIGHT);
+  audio_out->max_backlog_bytes =
+    (size_t) context->client_formats[format].nSamplesPerSec *
+    AUDIO_MAX_BUFFERED_MS / 1000 * audio_out->bytes_per_frame;
 
   g_message ("rdp: audio: playback %dms/packet (%d frames, %.0f packets/s)%s",
             latency_ms, audio_out->frames_per_packet,
