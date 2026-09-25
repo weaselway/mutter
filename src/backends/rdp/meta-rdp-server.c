@@ -19,6 +19,7 @@
 #include "config.h"
 
 #include "backends/rdp/meta-rdp-server.h"
+#include "backends/rdp/meta-rdp-audio.h"
 #include "backends/rdp/meta-rdp-clipboard.h"
 
 #include "backends/meta-backend-private.h"
@@ -158,6 +159,12 @@ typedef struct _MetaRdpPeerContext
    * source can be torn down together with the bridge (the fd dies with it). */
   GSource *clipboard_fd_source;
 
+  /* PulseAudio-over-RDP bridge (rdpsnd playback / audin capture), created on
+   * first activation. Each runs its own accept/read thread, so unlike
+   * clipboard there is no main-loop fd source to track here. */
+  MetaRdpAudioOut *audio_out;
+  MetaRdpAudioIn *audio_in;
+
   /* Debounced pointer button state, indexed by (button - BTN_LEFT). */
   gboolean button_state[8];
   gboolean mouse_button_swap;
@@ -179,6 +186,18 @@ typedef struct _MetaRdpPeerContext
   /* MS-RDPEDISP: the client tells us what resolution it wants. Like gfxredir,
    * the channel runs its own thread, so the layout PDU is only recorded here
    * and applied on the main loop -- resizing the monitor touches Clutter. */
+  /* Serialises WTSVirtualChannelManagerCheckFileDescriptorEx(), which is the
+   * only thing that actually writes queued channel data to the socket. The
+   * audio thread calls it too (see meta_rdp_peer_flush_channels), so that
+   * playback is not held hostage by whatever the main thread is doing.
+   *
+   * A mutex around the *whole* drain, not a lock inside it: the queue is
+   * shared by every channel, and two threads popping from it concurrently
+   * could send two chunks of one channel's PDU out of order. Serialising the
+   * loop means all pops happen inside one critical section, so queue order is
+   * preserved no matter which thread does the draining. */
+  GMutex vcm_drain_mutex;
+
   DispServerContext *disp;
   GMutex disp_mutex;
   guint disp_idle_id;
@@ -3762,6 +3781,7 @@ xf_peer_post_connect (freerdp_peer *client)
 }
 
 static gboolean rdp_client_activity (gpointer data);
+static void meta_rdp_peer_flush_channels (gpointer user_data);
 
 static BOOL
 xf_peer_activate (freerdp_peer *client)
@@ -3879,6 +3899,13 @@ xf_peer_activate (freerdp_peer *client)
    * caps PDU we queue here (Weston opens disp first for the same reason). */
   meta_rdp_setup_disp (peer_ctx);
 
+  if (!peer_ctx->audio_out)
+    peer_ctx->audio_out = meta_rdp_audio_out_new (peer_ctx->vcm,
+                                                  meta_rdp_peer_flush_channels,
+                                                  peer_ctx);
+  if (!peer_ctx->audio_in)
+    peer_ctx->audio_in = meta_rdp_audio_in_new (peer_ctx->vcm);
+
   meta_rdp_setup_gfxredir (peer_ctx);
 
   if (peer_ctx->use_gfxredir)
@@ -3892,6 +3919,33 @@ xf_peer_activate (freerdp_peer *client)
   meta_rdp_peer_force_full_present (peer_ctx);
 
   return TRUE;
+}
+
+/* Flush queued channel data to the socket from a non-main thread.
+ *
+ * Everything below CheckFileDescriptorEx is safe to reach from another thread:
+ * the message queue has its own lock, each PDU gets a freshly allocated stream
+ * (transport_send_stream_init), and transport_write serialises on
+ * transport->WriteLock. The one stateful hazard -- legacy RDP encryption, with
+ * its RC4 state and sequence counter -- does not apply because we only ever
+ * enable TLS, never FreeRDP_RdpSecurity, so rdp->do_crypt stays FALSE.
+ *
+ * autoOpen is deliberately FALSE: opening drdynvc is main-loop business, gated
+ * on client->activated, and has no place on an audio thread.
+ *
+ * Called by the audio bridge after submitting a packet, so that playback does
+ * not have to wait for the next main-loop iteration to reach the wire. */
+static void
+meta_rdp_peer_flush_channels (gpointer user_data)
+{
+  MetaRdpPeerContext *peer_ctx = user_data;
+
+  if (!peer_ctx || !peer_ctx->vcm)
+    return;
+
+  g_mutex_lock (&peer_ctx->vcm_drain_mutex);
+  (void) WTSVirtualChannelManagerCheckFileDescriptorEx (peer_ctx->vcm, FALSE);
+  g_mutex_unlock (&peer_ctx->vcm_drain_mutex);
 }
 
 static gboolean
@@ -3931,8 +3985,14 @@ rdp_client_activity_inner (gpointer data)
                        WTSVirtualChannelManagerIsChannelJoined (peer_ctx->vcm,
                                                                 DRDYNVC_SVC_CHANNEL_NAME);
 
-      if (!WTSVirtualChannelManagerCheckFileDescriptorEx (peer_ctx->vcm,
-                                                          auto_open))
+      BOOL vcm_ok;
+
+      g_mutex_lock (&peer_ctx->vcm_drain_mutex);
+      vcm_ok = WTSVirtualChannelManagerCheckFileDescriptorEx (peer_ctx->vcm,
+                                                             auto_open);
+      g_mutex_unlock (&peer_ctx->vcm_drain_mutex);
+
+      if (!vcm_ok)
         {
           g_message ("rdp: WTS VC CheckFileDescriptor failed for peer %p",
                      client);
@@ -3980,6 +4040,7 @@ rdp_peer_context_new (freerdp_peer *client, rdpContext *context)
 
   g_mutex_init (&peer_ctx->gfxredir_mutex);
   g_mutex_init (&peer_ctx->disp_mutex);
+  g_mutex_init (&peer_ctx->vcm_drain_mutex);
 
   /* Codec fallback encoder. */
   peer_ctx->nsc_context = nsc_context_new ();
@@ -4016,6 +4077,9 @@ rdp_peer_context_free (freerdp_peer *client, rdpContext *context)
   peer_ctx->clipboard_fd_source = NULL;
   meta_rdp_peer_clear_clipboard (peer_ctx);
 
+  g_clear_pointer (&peer_ctx->audio_out, meta_rdp_audio_out_free);
+  g_clear_pointer (&peer_ctx->audio_in, meta_rdp_audio_in_free);
+
   /* destroy_buffer() cancels any outstanding readback; this additionally drops
    * the PBO itself, which outlives individual pools. */
   meta_rdp_destroy_buffer (peer_ctx);
@@ -4050,6 +4114,7 @@ rdp_peer_context_free (freerdp_peer *client, rdpContext *context)
   g_clear_handle_id (&peer_ctx->disp_idle_id, g_source_remove);
   g_mutex_unlock (&peer_ctx->disp_mutex);
   g_mutex_clear (&peer_ctx->disp_mutex);
+  g_mutex_clear (&peer_ctx->vcm_drain_mutex);
 
   g_clear_pointer (&peer_ctx->missed_damage, mtk_region_unref);
 
