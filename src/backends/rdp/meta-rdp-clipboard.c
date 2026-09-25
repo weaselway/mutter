@@ -100,6 +100,7 @@ struct _MetaRdpClipboard
   /* Pending mutter-app paste waiting on a ClientFormatDataResponse. */
   GTask *pending_read; /* read from client_source */
   const MetaRdpClipboardFormat *pending_format;
+  guint pending_read_timeout_id;
 
   /* Set while we are applying a client-driven owner change, to ignore the
    * resulting owner-changed signal (avoid echoing it back to the client). */
@@ -110,7 +111,14 @@ struct _MetaRdpClipboard
   UINT32 server_requested_format_id;
   gboolean server_request_pending;
   GOutputStream *server_request_output;
+
+  /* Cancelled when the clipboard is freed, so in-flight selection transfers
+   * don't call back into freed memory. */
+  GCancellable *cancellable;
 };
+
+/* How long a mutter app waits for the client to answer a paste request. */
+#define PENDING_READ_TIMEOUT_MS 5000
 
 struct _MetaRdpSelectionSource
 {
@@ -324,6 +332,32 @@ meta_rdp_selection_source_get_mimetypes (MetaSelectionSource *source)
   return g_list_reverse (out);
 }
 
+static GTask *
+steal_pending_read (MetaRdpClipboard *clipboard)
+{
+  g_clear_handle_id (&clipboard->pending_read_timeout_id, g_source_remove);
+  clipboard->pending_format = NULL;
+
+  return g_steal_pointer (&clipboard->pending_read);
+}
+
+static gboolean
+on_pending_read_timeout (gpointer user_data)
+{
+  MetaRdpClipboard *clipboard = user_data;
+  g_autoptr (GTask) task = NULL;
+
+  clipboard->pending_read_timeout_id = 0;
+  task = steal_pending_read (clipboard);
+  if (task)
+    {
+      g_task_return_new_error (task, G_IO_ERROR, G_IO_ERROR_TIMED_OUT,
+                               "Client did not answer the clipboard request");
+    }
+
+  return G_SOURCE_REMOVE;
+}
+
 static void
 meta_rdp_selection_source_read_async (MetaSelectionSource *source,
                                       const char          *mimetype,
@@ -341,7 +375,7 @@ meta_rdp_selection_source_read_async (MetaSelectionSource *source,
   g_task_set_source_tag (task, meta_rdp_selection_source_read_async);
 
   format = format_by_mime (mimetype);
-  if (!format || !clipboard->cliprdr)
+  if (!format || !clipboard || !clipboard->cliprdr)
     {
       g_task_return_new_error (task, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED,
                                "Unsupported clipboard mime type '%s'", mimetype);
@@ -359,6 +393,8 @@ meta_rdp_selection_source_read_async (MetaSelectionSource *source,
 
   clipboard->pending_read = task;
   clipboard->pending_format = format;
+  clipboard->pending_read_timeout_id =
+    g_timeout_add (PENDING_READ_TIMEOUT_MS, on_pending_read_timeout, clipboard);
 
   request.requestedFormatId = format->format_id;
   request.common.msgType = CB_FORMAT_DATA_REQUEST;
@@ -366,8 +402,7 @@ meta_rdp_selection_source_read_async (MetaSelectionSource *source,
   if (clipboard->cliprdr->ServerFormatDataRequest (clipboard->cliprdr,
                                                    &request) != 0)
     {
-      clipboard->pending_read = NULL;
-      clipboard->pending_format = NULL;
+      steal_pending_read (clipboard);
       g_task_return_new_error (task, G_IO_ERROR, G_IO_ERROR_FAILED,
                                "ServerFormatDataRequest failed");
       g_object_unref (task);
@@ -412,6 +447,16 @@ meta_rdp_selection_source_init (MetaRdpSelectionSource *self)
 
 /* ------------------------------------------------------------------ */
 /* client -> mutter: publish the client's clipboard */
+
+/* Sources can outlive the clipboard (whoever is reading holds a ref), so
+ * detach them when we let go. */
+static void
+clear_client_source (MetaRdpClipboard *clipboard)
+{
+  if (clipboard->client_source)
+    clipboard->client_source->clipboard = NULL;
+  g_clear_object (&clipboard->client_source);
+}
 
 /* CLIPRDR ClientFormatList: the client announces available formats. */
 static UINT
@@ -465,8 +510,8 @@ on_client_format_list (CliprdrServerContext         *context,
                             META_SELECTION_SOURCE (source));
   clipboard->setting_owner = FALSE;
 
-  g_set_object (&clipboard->client_source, source);
-  g_object_unref (source);
+  clear_client_source (clipboard);
+  clipboard->client_source = source;
 
   return CHANNEL_RC_OK;
 }
@@ -483,9 +528,8 @@ on_client_format_data_response (CliprdrServerContext                  *context,
   GBytes *mime_bytes;
   GInputStream *stream;
 
-  task = g_steal_pointer (&clipboard->pending_read);
   format = clipboard->pending_format;
-  clipboard->pending_format = NULL;
+  task = steal_pending_read (clipboard);
 
   if (!task)
     return CHANNEL_RC_OK;
@@ -568,16 +612,24 @@ on_selection_transfer_finished (GObject      *source_object,
 {
   MetaRdpClipboard *clipboard = user_data;
   MetaSelection *selection = META_SELECTION (source_object);
-  g_autoptr (GOutputStream) output = g_steal_pointer (&clipboard->server_request_output);
+  g_autoptr (GOutputStream) output = NULL;
   CLIPRDR_FORMAT_DATA_RESPONSE response = { 0 };
   const MetaRdpClipboardFormat *format;
   g_autoptr (GError) error = NULL;
   g_autoptr (GBytes) mime_bytes = NULL;
   g_autoptr (GBytes) rdp_bytes = NULL;
+  gboolean ok;
 
+  ok = meta_selection_transfer_finish (selection, result, &error);
+
+  /* Only meta_rdp_clipboard_free() cancels; the clipboard is gone. */
+  if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
+    return;
+
+  output = g_steal_pointer (&clipboard->server_request_output);
   clipboard->server_request_pending = FALSE;
 
-  if (!meta_selection_transfer_finish (selection, result, &error))
+  if (!ok)
     {
       g_warning ("rdp: clipboard transfer failed: %s", error->message);
       goto fail;
@@ -657,7 +709,8 @@ on_client_format_data_request (CliprdrServerContext                 *context,
   output = g_memory_output_stream_new_resizable ();
   clipboard->server_request_output = g_object_ref (output);
   meta_selection_transfer_async (clipboard->selection, META_SELECTION_CLIPBOARD,
-                                 format->mime_type, -1, output, NULL,
+                                 format->mime_type, -1, output,
+                                 clipboard->cancellable,
                                  on_selection_transfer_finished, clipboard);
   g_object_unref (output);
 
@@ -682,7 +735,7 @@ on_selection_owner_changed (MetaSelection       *selection,
   /* A mutter app (or nothing) owns the clipboard now; the client's published
    * source is no longer current. */
   if (new_owner != META_SELECTION_SOURCE (clipboard->client_source))
-    g_clear_object (&clipboard->client_source);
+    clear_client_source (clipboard);
 
   send_server_format_list (clipboard);
 }
@@ -754,6 +807,7 @@ meta_rdp_clipboard_new (freerdp_peer *peer,
   clipboard = g_new0 (MetaRdpClipboard, 1);
   clipboard->peer = peer;
   clipboard->backend = backend;
+  clipboard->cancellable = g_cancellable_new ();
 
   context = meta_backend_get_context (backend);
   clipboard->display = meta_context_get_display (context);
@@ -783,6 +837,7 @@ meta_rdp_clipboard_new (freerdp_peer *peer,
     {
       g_warning ("rdp: cliprdr Open failed");
       cliprdr_server_context_free (cliprdr);
+      g_object_unref (clipboard->cancellable);
       g_free (clipboard);
       return NULL;
     }
@@ -833,11 +888,15 @@ meta_rdp_clipboard_free (MetaRdpClipboard *clipboard)
                               clipboard->selection);
     }
 
+  g_cancellable_cancel (clipboard->cancellable);
+  g_clear_object (&clipboard->cancellable);
+
   if (clipboard->pending_read)
     {
-      g_task_return_new_error (clipboard->pending_read, G_IO_ERROR,
+      g_autoptr (GTask) task = steal_pending_read (clipboard);
+
+      g_task_return_new_error (task, G_IO_ERROR,
                                G_IO_ERROR_CANCELLED, "Clipboard peer gone");
-      g_clear_object (&clipboard->pending_read);
     }
 
   g_clear_object (&clipboard->server_request_output);
@@ -846,7 +905,7 @@ meta_rdp_clipboard_free (MetaRdpClipboard *clipboard)
     {
       meta_selection_unset_owner (clipboard->selection, META_SELECTION_CLIPBOARD,
                                   META_SELECTION_SOURCE (clipboard->client_source));
-      g_clear_object (&clipboard->client_source);
+      clear_client_source (clipboard);
     }
 
   if (clipboard->cliprdr)
