@@ -4485,20 +4485,23 @@ xf_peer_activate (freerdp_peer *client)
       return FALSE;
     }
 
-  /* The client dictates the resolution: adopt whatever it negotiated. On the
-   * first activation this replaces the --virtual-monitor size the session
-   * started at; on a re-activation after our own DesktopResize the sizes
-   * already agree and this is a no-op. */
-  {
-    int width = (int) freerdp_settings_get_uint32 (settings, FreeRDP_DesktopWidth);
-    int height = (int) freerdp_settings_get_uint32 (settings, FreeRDP_DesktopHeight);
-    uint32_t scale_percent =
-      freerdp_settings_get_uint32 (settings, FreeRDP_DesktopScaleFactor);
+  /* The client dictates the resolution: adopt whatever it negotiated. This
+   * replaces the --virtual-monitor size the session started at. Only on the
+   * first activation: a re-activation follows our own DesktopResize, which
+   * display control already applied -- including its scale, which
+   * FreeRDP_DesktopScaleFactor (still the connect-time value) would undo,
+   * and a newer layout request may already be on its way. */
+  if (!peer_ctx->activated)
+    {
+      int width = (int) freerdp_settings_get_uint32 (settings, FreeRDP_DesktopWidth);
+      int height = (int) freerdp_settings_get_uint32 (settings, FreeRDP_DesktopHeight);
+      uint32_t scale_percent =
+        freerdp_settings_get_uint32 (settings, FreeRDP_DesktopScaleFactor);
 
-    meta_rdp_server_resize_monitor (peer_ctx->server, width, height,
-                                    meta_rdp_scale_from_percent (scale_percent,
-                                                                 width, height));
-  }
+      meta_rdp_server_resize_monitor (peer_ctx->server, width, height,
+                                      meta_rdp_scale_from_percent (scale_percent,
+                                                                   width, height));
+    }
 
   /* Everything past here is first-activation-only setup. */
   if (peer_ctx->activated)
