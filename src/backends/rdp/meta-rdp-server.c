@@ -210,6 +210,11 @@ typedef struct _MetaRdpPeerContext
   int disp_requested_height;
   uint32_t disp_requested_scale_percent;
 
+  /* Pumps the peer from the main loop until drdynvc reaches READY, after
+   * which activation is completed (meta_rdp_drdynvc_wait()). */
+  guint drdynvc_wait_id;
+  gint64 drdynvc_wait_start_us;
+
   /* Set between pushing a DesktopResize and the client's re-activation. The
    * client's surface is the old size until it comes back, so nothing may be
    * presented in the meantime. */
@@ -3028,12 +3033,12 @@ gfxredir_present_buffer_ack (GfxRedirServerContext                 *context,
   return CHANNEL_RC_OK;
 }
 
+/* Create and start the drdynvc server context. Reaching READY takes a caps
+ * exchange with the client; see meta_rdp_drdynvc_wait(). */
 static gboolean
-meta_rdp_ensure_drdynvc (MetaRdpPeerContext *peer_ctx)
+meta_rdp_start_drdynvc (MetaRdpPeerContext *peer_ctx)
 {
-  freerdp_peer *client = peer_ctx->peer;
   DrdynvcServerContext *drdynvc;
-  int wait_retry = 0;
 
   if (peer_ctx->drdynvc)
     return TRUE;
@@ -3056,44 +3061,6 @@ meta_rdp_ensure_drdynvc (MetaRdpPeerContext *peer_ctx)
     }
 
   peer_ctx->drdynvc = drdynvc;
-
-  /* Force the dynamic virtual channel to exchange caps and reach READY before
-   * any DVC (e.g. gfxredir) is opened. Ported from Weston's rdp_drdynvc_init.
-   *
-   * FreeRDP 2 only had DRDYNVC_STATE_NONE before READY; 3.x adds intermediate
-   * states (INITIALIZED, ...), so pump until READY rather than keying off NONE.
-   */
-  if (WTSVirtualChannelManagerGetDrdynvcState (peer_ctx->vcm) !=
-      DRDYNVC_STATE_READY)
-    {
-      client->activated = TRUE;
-      while (WTSVirtualChannelManagerGetDrdynvcState (peer_ctx->vcm) !=
-             DRDYNVC_STATE_READY)
-        {
-          if (++wait_retry > 10000) /* ~100s timeout */
-            {
-              g_warning ("rdp: drdynvc did not reach READY state");
-              return FALSE;
-            }
-          g_usleep (10000); /* 0.01s */
-          if (!client->CheckFileDescriptor (client))
-            {
-              g_warning ("rdp: peer died while waiting for drdynvc");
-              return FALSE;
-            }
-          /* FreeRDP 3 asserts if CheckFileDescriptor runs before the client
-           * has joined drdynvc. */
-          if (!WTSVirtualChannelManagerIsChannelJoined (peer_ctx->vcm,
-                                                        DRDYNVC_SVC_CHANNEL_NAME))
-            continue;
-          if (!WTSVirtualChannelManagerCheckFileDescriptor (peer_ctx->vcm))
-            {
-              g_warning ("rdp: WTS VC check failed while waiting for drdynvc");
-              return FALSE;
-            }
-        }
-    }
-
   return TRUE;
 }
 
@@ -4448,6 +4415,66 @@ xf_peer_post_connect (freerdp_peer *client)
 static gboolean rdp_client_activity (gpointer data);
 static void meta_rdp_peer_flush_channels (gpointer user_data);
 
+static BOOL meta_rdp_peer_finish_activation (freerdp_peer *client);
+
+#define META_RDP_DRDYNVC_TIMEOUT_S 30
+
+/* Main loop, every 10 ms while a peer waits for drdynvc to reach READY.
+ * FreeRDP 2 only had DRDYNVC_STATE_NONE before READY; 3.x adds intermediate
+ * states (INITIALIZED, ...), so wait for READY rather than keying off NONE. */
+static gboolean
+meta_rdp_drdynvc_wait (gpointer user_data)
+{
+  freerdp_peer *client = user_data;
+  MetaRdpPeerContext *peer_ctx = (MetaRdpPeerContext *) client->context;
+  gboolean ok;
+
+  if (WTSVirtualChannelManagerGetDrdynvcState (peer_ctx->vcm) ==
+      DRDYNVC_STATE_READY)
+    {
+      peer_ctx->drdynvc_wait_id = 0;
+      if (!meta_rdp_peer_finish_activation (client))
+        meta_rdp_peer_destroy (peer_ctx);
+      return G_SOURCE_REMOVE;
+    }
+
+  if (g_get_monotonic_time () - peer_ctx->drdynvc_wait_start_us >
+      META_RDP_DRDYNVC_TIMEOUT_S * G_USEC_PER_SEC)
+    {
+      g_warning ("rdp: drdynvc did not reach READY state");
+      goto fail;
+    }
+
+  if (!client->CheckFileDescriptor (client))
+    {
+      g_warning ("rdp: peer died while waiting for drdynvc");
+      goto fail;
+    }
+
+  /* FreeRDP 3 asserts if CheckFileDescriptor runs before the client has
+   * joined drdynvc. */
+  if (!WTSVirtualChannelManagerIsChannelJoined (peer_ctx->vcm,
+                                                DRDYNVC_SVC_CHANNEL_NAME))
+    return G_SOURCE_CONTINUE;
+
+  g_mutex_lock (&peer_ctx->vcm_drain_mutex);
+  ok = WTSVirtualChannelManagerCheckFileDescriptor (peer_ctx->vcm);
+  g_mutex_unlock (&peer_ctx->vcm_drain_mutex);
+
+  if (!ok)
+    {
+      g_warning ("rdp: WTS VC check failed while waiting for drdynvc");
+      goto fail;
+    }
+
+  return G_SOURCE_CONTINUE;
+
+fail:
+  peer_ctx->drdynvc_wait_id = 0;
+  meta_rdp_peer_destroy (peer_ctx);
+  return G_SOURCE_REMOVE;
+}
+
 static BOOL
 xf_peer_activate (freerdp_peer *client)
 {
@@ -4474,9 +4501,7 @@ xf_peer_activate (freerdp_peer *client)
 
   /* Weston's xf_peer_activate brings the virtual channels up first, on every
    * activation, and only then falls through to the once-per-peer setup. Keep
-   * that order: the drdynvc handshake below busy-pumps the peer, and anything
-   * opened before it (notably CLIPRDR) would queue PDUs that nothing drains
-   * until the handshake finishes. */
+   * that order: the dynamic channels need drdynvc READY. */
   if (!peer_ctx->vcm)
     {
       g_warning ("rdp: virtual channel manager is required for clipboard "
@@ -4485,11 +4510,35 @@ xf_peer_activate (freerdp_peer *client)
     }
 
   /* gfxredir is a dynamic virtual channel; drdynvc must be READY first. */
-  if (!meta_rdp_ensure_drdynvc (peer_ctx))
+  if (!meta_rdp_start_drdynvc (peer_ctx))
+    return FALSE;
+
+  if (WTSVirtualChannelManagerGetDrdynvcState (peer_ctx->vcm) !=
+      DRDYNVC_STATE_READY)
     {
-      g_warning ("rdp: drdynvc not ready");
-      return FALSE;
+      /* Ported from Weston's rdp_drdynvc_init, which busy-waited for READY
+       * here -- up to 100 s on the compositor thread. Pump from a timer
+       * instead and finish activating once it is READY. The pump only
+       * auto-opens drdynvc for an activated client. */
+      client->activated = TRUE;
+
+      if (!peer_ctx->drdynvc_wait_id)
+        {
+          peer_ctx->drdynvc_wait_start_us = g_get_monotonic_time ();
+          peer_ctx->drdynvc_wait_id =
+            g_timeout_add (10, meta_rdp_drdynvc_wait, client);
+        }
+      return TRUE;
     }
+
+  return meta_rdp_peer_finish_activation (client);
+}
+
+static BOOL
+meta_rdp_peer_finish_activation (freerdp_peer *client)
+{
+  MetaRdpPeerContext *peer_ctx = (MetaRdpPeerContext *) client->context;
+  rdpSettings *settings = client->context->settings;
 
   /* The client dictates the resolution: adopt whatever it negotiated. This
    * replaces the --virtual-monitor size the session started at. Only on the
@@ -4818,6 +4867,8 @@ rdp_peer_context_free (freerdp_peer *client, rdpContext *context)
                      (GDestroyNotify) meta_rdp_pending_gesture_free);
 
   g_clear_pointer (&peer_ctx->missed_damage, mtk_region_unref);
+
+  g_clear_handle_id (&peer_ctx->drdynvc_wait_id, g_source_remove);
 
   if (peer_ctx->drdynvc)
     {
