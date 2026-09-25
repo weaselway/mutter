@@ -3469,8 +3469,13 @@ meta_rdp_rdpei_queue_gesture_locked (MetaRdpPeerContext          *peer_ctx,
 
   g_queue_push_tail (peer_ctx->rdpei_pending_gestures, pending);
 
+  /* G_PRIORITY_DEFAULT for the same reason as the gfxredir dispatch: at idle
+   * priority, gestures starve while the compositor keeps repainting, which
+   * is exactly what an animated swipe makes it do. */
   if (!peer_ctx->rdpei_idle_id)
-    peer_ctx->rdpei_idle_id = g_idle_add (meta_rdp_rdpei_dispatch, peer_ctx);
+    peer_ctx->rdpei_idle_id =
+      g_idle_add_full (G_PRIORITY_DEFAULT, meta_rdp_rdpei_dispatch,
+                       peer_ctx, NULL);
 }
 
 /* Call with rdpei_mutex held. Re-evaluates gesture state against the
