@@ -39,14 +39,16 @@ These are the same as `weaselway/dev/build-mutter.sh`, without
 ## Notes
 
 - The dev shell takes its dependencies from nixpkgs' own mutter
-  (`inputsFrom = [ pkgs.mutter ]`, 50.4, the same release as `main`), plus
-  `freerdp` (3.x; nixpkgs builds mutter without RDP) and `pipewire` for the
-  RDP audio path.
+  (`inputsFrom = [ pkgs.mutter ]`, 50.4), plus
+  `freerdp` (3.x; nixpkgs builds mutter without RDP), `openssl` for the
+  session's TLS certificate, and `pipewire` for the RDP audio path.
 - The gfxredir channel is built from `src/backends/rdp/gfxredir` because
   stock FreeRDP ships the header but no symbols. That means nixpkgs' plain
   freerdp is enough.
 - The first configure downloads the `gvdb` subproject and leaves an untracked
   `subprojects/.wraplock`. Both are harmless.
-- `weaselway/ubuntu/resolute/build-mutter.sh` packages the `50.1-wslg`
-  branch, not `main`. Building that branch against this shell (50.4 deps)
-  hasn't been tried.
+- Branches: `main` and `50.4-wslg` are the same 50.4 tree, which the
+  NixOS image builds. `50.1-wslg` carries the same RDP backend on 50.1, which
+  the Ubuntu packages (`weaselway/ubuntu/resolute/build-mutter.sh`) build.
+  All three carry this shell, so changes go to `main` and are cherry-picked
+  onto both release branches.
