@@ -61,6 +61,11 @@
 
 #include <cairo.h>
 
+#include <openssl/err.h>
+#include <openssl/evp.h>
+#include <openssl/pem.h>
+#include <openssl/x509.h>
+
 #include <freerdp/freerdp.h>
 #include <freerdp/crypto/certificate.h>
 #include <freerdp/crypto/privatekey.h>
@@ -389,10 +394,9 @@ struct _MetaRdpServer
   int n_listener_fd_sources;
   int owned_listen_fd; /* vsock fd we created ourselves, or -1 */
 
-  /* Throwaway self-signed TLS material generated at startup. */
-  char *cert_dir;
-  char *cert_file;
-  char *key_file;
+  /* Throwaway self-signed TLS material generated at startup, as PEM. */
+  char *cert_pem;
+  char *key_pem;
 
   /* virtio-fs/DAX shared-memory mount gfxredir allocates its pools on, or
    * NULL with shared_memory_error saying why. */
@@ -5065,16 +5069,16 @@ rdp_peer_init (freerdp_peer *client, MetaRdpServer *self)
    * disabled to match wslg_desktop.rdp (authentication level:i:0).
    *
    * FreeRDP 3 removed settings->{Certificate,PrivateKey}File; the cert and key
-   * are now first-class objects handed to the settings as pointers. */
-  if (self->cert_file && self->key_file)
+   * are now first-class objects handed to the settings as pointers. Each peer
+   * gets its own, parsed from the PEM, since the settings take ownership. */
+  if (self->cert_pem && self->key_pem)
     {
-      rdpPrivateKey *key = freerdp_key_new_from_file (self->key_file);
-      rdpCertificate *cert = freerdp_certificate_new_from_file (self->cert_file);
+      rdpPrivateKey *key = freerdp_key_new_from_pem (self->key_pem);
+      rdpCertificate *cert = freerdp_certificate_new_from_pem (self->cert_pem);
 
       if (!key || !cert)
         {
-          g_warning ("rdp: failed to load TLS cert/key (%s, %s)",
-                     self->cert_file, self->key_file);
+          g_warning ("rdp: failed to load the session TLS cert/key");
           freerdp_key_free (key);
           freerdp_certificate_free (cert);
           goto error;
@@ -5303,95 +5307,84 @@ rdp_implant_listener (MetaRdpServer    *self,
   return TRUE;
 }
 
-/* The directory holds the session's private key, so don't leave it behind.
- * winpr-makecert writes a few files besides the two we use. */
-static void
-meta_rdp_remove_cert_dir (MetaRdpServer *self)
+/* The session's TLS identity: a throwaway self-signed RSA-2048 certificate,
+ * made in memory at startup and never written anywhere.
+ *
+ * Nothing verifies it -- the client runs with /cert:ignore, and the transport is
+ * a Hyper-V socket inside the machine -- but FreeRDP's server will not
+ * initialize a peer without one (freerdp_peer_initialize: "Missing server
+ * certificate"), whichever security protocol ends up negotiated. This used to
+ * shell out to winpr-makecert, which is not on PATH everywhere (NixOS) and
+ * left the private key in a temp directory for the session's lifetime. */
+static char *
+meta_rdp_bio_to_string (BIO *bio)
 {
-  g_autoptr (GDir) dir = NULL;
-  const char *name;
+  char *data = NULL;
+  long length = BIO_get_mem_data (bio, &data);
 
-  if (!self->cert_dir)
-    return;
-
-  dir = g_dir_open (self->cert_dir, 0, NULL);
-  if (dir)
-    {
-      while ((name = g_dir_read_name (dir)))
-        {
-          g_autofree char *path = g_build_filename (self->cert_dir, name, NULL);
-
-          if (g_unlink (path) != 0)
-            g_warning ("rdp: failed to remove %s: %s", path, g_strerror (errno));
-        }
-    }
-
-  if (g_rmdir (self->cert_dir) != 0 && errno != ENOENT)
-    g_warning ("rdp: failed to remove %s: %s", self->cert_dir, g_strerror (errno));
+  return length > 0 ? g_strndup (data, length) : NULL;
 }
 
 static gboolean
 meta_rdp_generate_session_tls (MetaRdpServer  *self,
                                GError        **error)
 {
-  g_autofree char *tmpl = NULL;
-  g_autofree char *stdout_buf = NULL;
-  g_autofree char *stderr_buf = NULL;
-  const char *argv[] = {
-    "winpr-makecert",
-    "-silent",
-    "-format", "crt",
-    "-n", "CN=mutter-rdp",
-    "-path", NULL, /* filled in below */
-    "mutter-rdp",
-    NULL,
-  };
-  int exit_status = 0;
+  EVP_PKEY *pkey = NULL;
+  X509 *x509 = NULL;
+  X509_NAME *name;
+  BIO *cert_bio = NULL;
+  BIO *key_bio = NULL;
+  gboolean ok = FALSE;
 
-  tmpl = g_build_filename (g_get_tmp_dir (), "mutter-rdp-cert-XXXXXX", NULL);
-  self->cert_dir = g_mkdtemp (tmpl);
-  if (!self->cert_dir)
+  pkey = EVP_RSA_gen (2048);
+  x509 = X509_new ();
+  cert_bio = BIO_new (BIO_s_mem ());
+  key_bio = BIO_new (BIO_s_mem ());
+  if (!pkey || !x509 || !cert_bio || !key_bio)
+    goto out;
+
+  if (!X509_set_version (x509, X509_VERSION_3) ||
+      !ASN1_INTEGER_set (X509_get_serialNumber (x509), g_random_int_range (1, G_MAXINT32)) ||
+      !X509_gmtime_adj (X509_getm_notBefore (x509), 0) ||
+      !X509_gmtime_adj (X509_getm_notAfter (x509), 365L * 24 * 60 * 60) ||
+      !X509_set_pubkey (x509, pkey))
+    goto out;
+
+  name = X509_get_subject_name (x509);
+  if (!X509_NAME_add_entry_by_txt (name, "CN", MBSTRING_ASC,
+                                   (const unsigned char *) "mutter-rdp",
+                                   -1, -1, 0) ||
+      !X509_set_issuer_name (x509, name) ||
+      !X509_sign (x509, pkey, EVP_sha256 ()))
+    goto out;
+
+  if (!PEM_write_bio_X509 (cert_bio, x509) ||
+      !PEM_write_bio_PrivateKey (key_bio, pkey, NULL, NULL, 0, NULL, NULL))
+    goto out;
+
+  self->cert_pem = meta_rdp_bio_to_string (cert_bio);
+  self->key_pem = meta_rdp_bio_to_string (key_bio);
+  ok = self->cert_pem && self->key_pem;
+
+out:
+  if (!ok)
     {
-      g_set_error (error, G_FILE_ERROR, g_file_error_from_errno (errno),
-                   "failed to create temp dir for RDP cert: %s",
-                   g_strerror (errno));
-      return FALSE;
+      unsigned long err = ERR_get_error ();
+
+      g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                   "generating the session TLS certificate failed: %s",
+                   err ? ERR_reason_error_string (err) : "unknown error");
     }
-  g_steal_pointer (&tmpl);
-
-  argv[7] = self->cert_dir;
-
-  if (!g_spawn_sync (NULL, (char **) argv, NULL,
-                     G_SPAWN_SEARCH_PATH,
-                     NULL, NULL,
-                     &stdout_buf, &stderr_buf,
-                     &exit_status, error))
+  else
     {
-      g_prefix_error (error, "failed to run winpr-makecert: ");
-      return FALSE;
-    }
-
-  if (!g_spawn_check_wait_status (exit_status, error))
-    {
-      g_prefix_error (error, "winpr-makecert failed (%s): ",
-                      stderr_buf ? stderr_buf : "no output");
-      return FALSE;
-    }
-
-  self->cert_file = g_build_filename (self->cert_dir, "mutter-rdp.crt", NULL);
-  self->key_file = g_build_filename (self->cert_dir, "mutter-rdp.key", NULL);
-
-  if (!g_file_test (self->cert_file, G_FILE_TEST_EXISTS) ||
-      !g_file_test (self->key_file, G_FILE_TEST_EXISTS))
-    {
-      g_set_error (error, G_FILE_ERROR, G_FILE_ERROR_NOENT,
-                   "winpr-makecert did not produce %s / %s",
-                   self->cert_file, self->key_file);
-      return FALSE;
+      g_message ("rdp: generated the session TLS certificate");
     }
 
-  g_message ("rdp: generated session TLS cert at %s", self->cert_file);
-  return TRUE;
+  BIO_free (key_bio);
+  BIO_free (cert_bio);
+  X509_free (x509);
+  EVP_PKEY_free (pkey);
+  return ok;
 }
 
 static int
@@ -5758,10 +5751,12 @@ meta_rdp_server_dispose (GObject *object)
       self->owned_listen_fd = -1;
     }
 
-  meta_rdp_remove_cert_dir (self);
-  g_clear_pointer (&self->cert_file, g_free);
-  g_clear_pointer (&self->key_file, g_free);
-  g_clear_pointer (&self->cert_dir, g_free);
+  g_clear_pointer (&self->cert_pem, g_free);
+  if (self->key_pem)
+    {
+      explicit_bzero (self->key_pem, strlen (self->key_pem));
+      g_clear_pointer (&self->key_pem, g_free);
+    }
   g_clear_pointer (&self->shared_memory_mount_path, g_free);
   g_clear_pointer (&self->shared_memory_error, g_free);
 
