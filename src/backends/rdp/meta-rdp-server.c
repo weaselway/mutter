@@ -4,13 +4,14 @@
  * In-process RDP/VAIL output backend for mutter (WSLg).
  *
  * An in-process FreeRDP 3 server listening on vsock. It presents the
- * composited desktop through gfxredir shared memory (or raw SURFACE_BITS as
- * a fallback), and bridges input, the clipboard (CLIPRDR), display control
+ * composited desktop through gfxredir shared memory, and bridges input, the clipboard (CLIPRDR), display control
  * (DISP), touchpad gestures (RDPEI) and audio (rdpsnd/audin, see
  * meta-rdp-audio.c).
  *
  * Originally ported from wslg/weston/libweston/backend-rdp/rdp.c (minus
- * RAIL). Weston's wl_event_loop fd wiring is replaced with GSources attached
+ * RAIL). There is no codec path: when gfxredir cannot be used, the client gets
+ * an error frame saying why instead of the desktop (meta_rdp_peer_fail()).
+ * Weston's wl_event_loop fd wiring is replaced with GSources attached
  * to mutter's default GMainContext; the peer is driven from mutter's main
  * thread, while the gfxredir, disp, rdpei and audio channels run their own
  * threads and hand work back to the main loop.
@@ -57,6 +58,8 @@
 #include <linux/input.h>
 
 #include <glib/gstdio.h>
+
+#include <cairo.h>
 
 #include <freerdp/freerdp.h>
 #include <freerdp/crypto/certificate.h>
@@ -275,10 +278,20 @@ typedef struct _MetaRdpPeerContext
   float last_pointer_x;
   float last_pointer_y;
 
-  /* Fast path: gfxredir shared-memory present. */
+  /* gfxredir shared-memory present, the only way the desktop is sent. */
   GfxRedirServerContext *gfxredir;
   gboolean gfxredir_activated; /* caps confirmed; g_atomic, see below */
-  gboolean use_gfxredir;       /* shared-memory mount available */
+
+  /* Set once gfxredir turns out to be unusable for this peer, see
+   * meta_rdp_peer_fail(). From then on the client only gets the error frame,
+   * which is re-sent when the framebuffer size changes. */
+  char *error_reason;
+  char *error_hint;
+  int error_frame_width;
+  int error_frame_height;
+
+  /* Gives up on a client that never confirms gfxredir caps. */
+  guint gfxredir_caps_timeout_id;
 
   /* gfxredir_server_open() spawns its own reader thread, so the channel
    * callbacks do NOT run on the main thread. Presenting touches Clutter/Cogl
@@ -290,6 +303,7 @@ typedef struct _MetaRdpPeerContext
   GMutex gfxredir_mutex;
   guint gfxredir_idle_id;
   gboolean gfxredir_present_requested; /* caps confirmed: fill the screen */
+  const char *gfxredir_caps_error;     /* caps rejected: why, for the error frame */
   /* presentIds the client has acked, handed over for the main thread to
    * retire. Bounded by the number of buffers, since we never have more
    * presents outstanding than that. */
@@ -380,8 +394,10 @@ struct _MetaRdpServer
   char *cert_file;
   char *key_file;
 
-  /* virtio-fs/DAX shared-memory mount for the gfxredir fast path, or NULL. */
+  /* virtio-fs/DAX shared-memory mount gfxredir allocates its pools on, or
+   * NULL with shared_memory_error saying why. */
   char *shared_memory_mount_path;
+  char *shared_memory_error;
 
   GList *peers; /* MetaRdpPeerContext* */
 };
@@ -541,7 +557,7 @@ meta_rdp_server_resize_monitor (MetaRdpServer *self,
 }
 
 /* ------------------------------------------------------------------ */
-/* pixel readback + present (gfxredir fast path / codec fallback) */
+/* pixel readback + present (gfxredir) */
 /* ------------------------------------------------------------------ */
 
 static MetaStage *
@@ -1032,98 +1048,158 @@ meta_rdp_read_framebuffer (CoglFramebuffer *framebuffer,
   return ok;
 }
 
-/* Warn when a single present blocks the main loop for longer than this. */
-#define META_RDP_SLOW_UPDATE_US (30 * 1000)
+/* ------------------------------------------------------------------ */
+/* Error frame                                                          */
+/*                                                                      */
+/* gfxredir is the only way the desktop is sent. Encoding frames into   */
+/* SURFACE_BITS instead would work after a fashion, but at a fraction   */
+/* of the speed, and a session that silently runs that slowly is worse  */
+/* than one that plainly does not run. So when gfxredir cannot be used, */
+/* the client gets a magenta frame with the reason written on it.       */
+/* ------------------------------------------------------------------ */
+
+/* What the error frame suggests, by where things went wrong. */
+#define META_RDP_HINT_SYSTEM_DISTRO \
+  "Is systemDistro= in .wslconfig the weaselway system image, followed by wsl --shutdown?"
+#define META_RDP_HINT_CLIENT \
+  "Connect with weaselway's sdl-freerdp.exe and /wslgsharedmemorypath:, as start-viewer does."
+
+/* Sent as raw SURFACE_BITS in bands, each small enough to fit the client's
+ * reassembly limit (FreeRDP_MultifragMaxRequestSize) with room for headers. */
+#define META_RDP_ERROR_BAND_HEADROOM 1024
 
 static void
-meta_rdp_present_codec (MetaRdpPeerContext *peer_ctx,
-                        CoglFramebuffer    *framebuffer,
-                        const MtkRectangle *damage)
+meta_rdp_error_frame_draw_line (cairo_t    *cr,
+                                const char *text,
+                                double      size,
+                                double      margin,
+                                double      max_width,
+                                double     *y)
+{
+  cairo_text_extents_t extents;
+
+  cairo_set_font_size (cr, size);
+  cairo_text_extents (cr, text, &extents);
+  /* Shrink rather than clip: a narrow window still gets the whole message. */
+  if (extents.x_advance > max_width)
+    {
+      size *= max_width / extents.x_advance;
+      cairo_set_font_size (cr, size);
+    }
+
+  *y += size * 1.5;
+  cairo_move_to (cr, margin, *y);
+  cairo_show_text (cr, text);
+}
+
+static void
+meta_rdp_present_error (MetaRdpPeerContext *peer_ctx,
+                        CoglFramebuffer    *framebuffer)
 {
   freerdp_peer *client = peer_ctx->peer;
   rdpUpdate *update = client->context->update;
+  rdpSettings *settings = client->context->settings;
   int width = cogl_framebuffer_get_width (framebuffer);
   int height = cogl_framebuffer_get_height (framebuffer);
-  g_autofree uint8_t *pixels = NULL;
-  SURFACE_BITS_COMMAND cmd = { 0 };
-  MtkRectangle rect;
-  int sub_stride;
+  cairo_surface_t *surface;
+  cairo_t *cr;
+  const uint8_t *pixels;
+  g_autofree uint8_t *band = NULL;
+  uint32_t max_bytes;
+  int stride, band_rows;
+  double size, margin, max_width, y = 0;
 
-  /* Clip damage to the framebuffer bounds. */
-  rect = *damage;
-
-  if (rect.x < 0) { rect.width += rect.x; rect.x = 0; }
-  if (rect.y < 0) { rect.height += rect.y; rect.y = 0; }
-  if (rect.x + rect.width > width)
-    rect.width = width - rect.x;
-  if (rect.y + rect.height > height)
-    rect.height = height - rect.y;
-  if (rect.width <= 0 || rect.height <= 0)
+  /* The frame is static, so once is enough until the size changes. */
+  if (peer_ctx->error_frame_width == width &&
+      peer_ctx->error_frame_height == height)
     return;
 
-  g_debug ("rdp: present_codec enter rect=%d,%d %dx%d", rect.x, rect.y, rect.width, rect.height);
+  surface = cairo_image_surface_create (CAIRO_FORMAT_RGB24, width, height);
+  cr = cairo_create (surface);
 
-  /* Read back only the damage rect, tightly packed. */
-  sub_stride = rect.width * 4;
-  pixels = g_malloc ((size_t) sub_stride * rect.height);
-  if (!meta_rdp_read_framebuffer (framebuffer, pixels,
-                                  rect.x, rect.y,
-                                  rect.width, rect.height, sub_stride))
+  cairo_set_source_rgb (cr, 1.0, 0.0, 1.0);
+  cairo_paint (cr);
+
+  cairo_set_source_rgb (cr, 0.0, 0.0, 0.0);
+  cairo_select_font_face (cr, "sans-serif",
+                          CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
+  size = MAX (12.0, width / 40.0);
+  margin = size;
+  max_width = width - 2 * margin;
+  meta_rdp_error_frame_draw_line (cr, "weaselway: no shared-memory graphics",
+                                  size, margin, max_width, &y);
+  cairo_select_font_face (cr, "sans-serif",
+                          CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
+  y += size / 2;
+  meta_rdp_error_frame_draw_line (cr, peer_ctx->error_reason,
+                                  size * 0.6, margin, max_width, &y);
+  if (peer_ctx->error_hint)
+    meta_rdp_error_frame_draw_line (cr, peer_ctx->error_hint,
+                                    size * 0.6, margin, max_width, &y);
+  y += size / 2;
+  meta_rdp_error_frame_draw_line (cr, "The mutter log has the details: "
+                                  "journalctl --user -u 'org.gnome.Shell@*'",
+                                  size * 0.5, margin, max_width, &y);
+
+  cairo_destroy (cr);
+  cairo_surface_flush (surface);
+
+  if (cairo_surface_status (surface) != CAIRO_STATUS_SUCCESS)
     {
-      g_warning ("rdp: framebuffer readback failed (codec path)");
+      g_warning ("rdp: drawing the error frame failed: %s",
+                 cairo_status_to_string (cairo_surface_status (surface)));
+      cairo_surface_destroy (surface);
       return;
     }
 
-  g_debug ("rdp: present_codec readback done");
+  pixels = cairo_image_surface_get_data (surface);
+  stride = cairo_image_surface_get_stride (surface);
 
-  cmd.cmdType = CMDTYPE_SET_SURFACE_BITS;
-  cmd.destLeft = rect.x;
-  cmd.destTop = rect.y;
-  cmd.destRight = rect.x + rect.width;
-  cmd.destBottom = rect.y + rect.height;
-  cmd.bmp.bpp = 32;
-  cmd.bmp.width = rect.width;
-  cmd.bmp.height = rect.height;
+  max_bytes = freerdp_settings_get_uint32 (settings,
+                                           FreeRDP_MultifragMaxRequestSize);
+  band_rows = 1;
+  if (max_bytes > META_RDP_ERROR_BAND_HEADROOM + (uint32_t) width * 4)
+    band_rows = (max_bytes - META_RDP_ERROR_BAND_HEADROOM) / (width * 4);
+  band_rows = MIN (band_rows, height);
+  band = g_malloc ((size_t) width * 4 * band_rows);
 
-  /* Raw: copy the damage sub-rect tightly, flipping it bottom-up. An
-   * uncompressed SURFACE_BITS bitmap is stored bottom-up, the usual Windows
-   * DIB convention, while the readback above is top-down. */
-  {
-    g_autofree uint8_t *sub = NULL;
-    int y;
+  /* CAIRO_FORMAT_RGB24 is BGRX in memory on little endian, which is what a
+   * 32 bpp RDP bitmap is. Raw SURFACE_BITS bitmaps are bottom-up, so each band
+   * is flipped as it is packed. */
+  for (int top = 0; top < height; top += band_rows)
+    {
+      SURFACE_BITS_COMMAND cmd = { 0 };
+      int rows = MIN (band_rows, height - top);
 
-    sub = g_malloc ((size_t) sub_stride * rect.height);
-    for (y = 0; y < rect.height; y++)
-      {
-        memcpy (sub + (size_t) y * sub_stride,
-                pixels + (size_t) (rect.height - 1 - y) * sub_stride,
-                (size_t) sub_stride);
-      }
+      for (int r = 0; r < rows; r++)
+        memcpy (band + (size_t) r * width * 4,
+                pixels + (size_t) (top + rows - 1 - r) * stride,
+                (size_t) width * 4);
 
-    cmd.bmp.codecID = 0;
-    cmd.bmp.bitmapDataLength = sub_stride * rect.height;
-    cmd.bmp.bitmapData = sub;
-    g_debug ("rdp: present_codec calling SurfaceBits (raw, %u bytes)",
-             cmd.bmp.bitmapDataLength);
+      cmd.cmdType = CMDTYPE_SET_SURFACE_BITS;
+      cmd.destLeft = 0;
+      cmd.destTop = top;
+      cmd.destRight = width;
+      cmd.destBottom = top + rows;
+      cmd.bmp.bpp = 32;
+      cmd.bmp.codecID = 0;
+      cmd.bmp.width = width;
+      cmd.bmp.height = rows;
+      cmd.bmp.bitmapDataLength = width * 4 * rows;
+      cmd.bmp.bitmapData = band;
 
-    /* SurfaceBits runs on the main loop, so however long it blocks is time the
-     * compositor is not painting or servicing input. */
-    int64_t started_us = g_get_monotonic_time ();
-    update->SurfaceBits (update->context, &cmd);
-    int64_t elapsed_us = g_get_monotonic_time () - started_us;
+      if (!update->SurfaceBits (update->context, &cmd))
+        {
+          g_warning ("rdp: sending the error frame failed");
+          break;
+        }
+    }
 
-    if (elapsed_us > META_RDP_SLOW_UPDATE_US)
-      {
-        g_warning ("rdp: SurfaceBits blocked %.1f ms for %u bytes "
-                   "(%dx%d at %d,%d)",
-                   elapsed_us / 1000.0, cmd.bmp.bitmapDataLength,
-                   rect.width, rect.height, rect.x, rect.y);
-      }
+  cairo_surface_destroy (surface);
 
-    g_debug ("rdp: present_codec SurfaceBits returned (raw)");
-  }
-
-  g_debug ("rdp: present_codec exit");
+  peer_ctx->error_frame_width = width;
+  peer_ctx->error_frame_height = height;
+  g_message ("rdp: sent the error frame (%dx%d)", width, height);
 }
 
 static void
@@ -1845,6 +1921,10 @@ meta_rdp_readback_begin (MetaRdpPeerContext *peer_ctx,
   return TRUE;
 }
 
+static void meta_rdp_peer_fail (MetaRdpPeerContext *peer_ctx,
+                                const char         *reason,
+                                const char         *hint);
+
 static void
 meta_rdp_present_gfxredir (MetaRdpPeerContext *peer_ctx,
                            CoglFramebuffer    *framebuffer,
@@ -1857,7 +1937,12 @@ meta_rdp_present_gfxredir (MetaRdpPeerContext *peer_ctx,
   int index;
 
   if (!meta_rdp_ensure_buffer (peer_ctx, width, height))
-    return;
+    {
+      meta_rdp_peer_fail (peer_ctx,
+                          "The shared-memory pool could not be created.",
+                          NULL);
+      return;
+    }
 
   index = meta_rdp_acquire_buffer (peer_ctx);
   if (index < 0)
@@ -2126,7 +2211,7 @@ meta_rdp_peer_sync_desktop_size (MetaRdpPeerContext *peer_ctx,
   return TRUE;
 }
 
-/* Present the current frame to one peer, choosing fast path or fallback. */
+/* Present the current frame to one peer. */
 static void
 meta_rdp_peer_present (MetaRdpPeerContext *peer_ctx,
                        CoglFramebuffer    *framebuffer,
@@ -2142,44 +2227,44 @@ meta_rdp_peer_present (MetaRdpPeerContext *peer_ctx,
   if (meta_rdp_peer_sync_desktop_size (peer_ctx, framebuffer))
     return;
 
+  if (peer_ctx->error_reason)
+    {
+      meta_rdp_present_error (peer_ctx, framebuffer);
+      return;
+    }
+
   if (mtk_region_is_empty (damage))
     return;
 
-  if (peer_ctx->use_gfxredir)
+  /* Still waiting for the client to confirm gfxredir caps. */
+  if (!g_atomic_int_get (&peer_ctx->gfxredir_activated))
+    return;
+
+  /* With more than one buffer we can start a frame while the client is
+   * still reading the previous one; we only have to wait when every
+   * buffer is in flight, or when the previous frame's readback has not
+   * landed yet (only one is outstanding at a time). */
+  if (peer_ctx->n_presents_inflight >= META_RDP_N_BUFFERS ||
+      peer_ctx->readback_pending)
     {
-      if (!g_atomic_int_get (&peer_ctx->gfxredir_activated))
-        return;
-
-      /* With more than one buffer we can start a frame while the client is
-       * still reading the previous one; we only have to wait when every
-       * buffer is in flight, or when the previous frame's readback has not
-       * landed yet (only one is outstanding at a time). */
-      if (peer_ctx->n_presents_inflight >= META_RDP_N_BUFFERS ||
-          peer_ctx->readback_pending)
+      /* Coalesce by merging this damage into what we still owe the
+       * client, rather than dropping it and re-sending the whole screen
+       * once an ack arrives. */
+      if (peer_ctx->frame_missed)
         {
-          /* Coalesce by merging this damage into what we still owe the
-           * client, rather than dropping it and re-sending the whole screen
-           * once an ack arrives. */
-          if (peer_ctx->frame_missed)
-            {
-              mtk_region_union (peer_ctx->missed_damage, damage);
-            }
-          else
-            {
-              g_clear_pointer (&peer_ctx->missed_damage, mtk_region_unref);
-              peer_ctx->missed_damage = mtk_region_copy (damage);
-              peer_ctx->frame_missed = TRUE;
-            }
-          return;
+          mtk_region_union (peer_ctx->missed_damage, damage);
         }
-
-      extents = mtk_region_get_extents (damage);
-      meta_rdp_present_gfxredir (peer_ctx, framebuffer, &extents);
+      else
+        {
+          g_clear_pointer (&peer_ctx->missed_damage, mtk_region_unref);
+          peer_ctx->missed_damage = mtk_region_copy (damage);
+          peer_ctx->frame_missed = TRUE;
+        }
       return;
     }
 
   extents = mtk_region_get_extents (damage);
-  meta_rdp_present_codec (peer_ctx, framebuffer, &extents);
+  meta_rdp_present_gfxredir (peer_ctx, framebuffer, &extents);
 }
 
 /* Present a region of the current composited contents. A NULL region means the
@@ -2231,6 +2316,31 @@ meta_rdp_peer_force_full_present (MetaRdpPeerContext *peer_ctx)
   meta_rdp_peer_present_region (peer_ctx, NULL);
 }
 
+/* Give up on gfxredir for this peer: log why, and send the error frame in place
+ * of the desktop from now on. Main thread only.
+ *
+ * The first reason sticks. Anything failing after it is almost always a
+ * consequence, and the frame should name the cause. */
+static void
+meta_rdp_peer_fail (MetaRdpPeerContext *peer_ctx,
+                    const char         *reason,
+                    const char         *hint)
+{
+  if (peer_ctx->error_reason)
+    return;
+
+  g_warning ("rdp: no shared-memory graphics, sending the error frame: %s%s%s",
+             reason, hint ? " " : "", hint ? hint : "");
+
+  peer_ctx->error_reason = g_strdup (reason);
+  peer_ctx->error_hint = g_strdup (hint);
+  peer_ctx->error_frame_width = 0;
+  peer_ctx->error_frame_height = 0;
+  g_clear_handle_id (&peer_ctx->gfxredir_caps_timeout_id, g_source_remove);
+
+  meta_rdp_peer_force_full_present (peer_ctx);
+}
+
 /* Main-loop half of the gfxredir channel callbacks.
  *
  * The callbacks themselves run on the channel's reader thread, so they only
@@ -2241,12 +2351,14 @@ meta_rdp_peer_gfxredir_dispatch (gpointer user_data)
 {
   MetaRdpPeerContext *peer_ctx = user_data;
   gboolean full_requested;
+  const char *caps_error;
   uint64_t acked[META_RDP_N_BUFFERS];
   int n_acked;
   g_autoptr (MtkRegion) region = NULL;
 
   g_mutex_lock (&peer_ctx->gfxredir_mutex);
   peer_ctx->gfxredir_idle_id = 0;
+  caps_error = g_steal_pointer (&peer_ctx->gfxredir_caps_error);
   /* A standing request (caps just confirmed) always means the whole screen:
    * the client has nothing to composite a partial update onto yet. */
   full_requested = peer_ctx->gfxredir_present_requested;
@@ -2255,6 +2367,12 @@ meta_rdp_peer_gfxredir_dispatch (gpointer user_data)
   memcpy (acked, peer_ctx->gfxredir_acked, sizeof (acked));
   peer_ctx->gfxredir_n_acked = 0;
   g_mutex_unlock (&peer_ctx->gfxredir_mutex);
+
+  if (caps_error)
+    {
+      meta_rdp_peer_fail (peer_ctx, caps_error, META_RDP_HINT_CLIENT);
+      return G_SOURCE_REMOVE;
+    }
 
   /* Retire the acked presents: those buffers are ours to write again. */
   for (int a = 0; a < n_acked; a++)
@@ -2927,12 +3045,25 @@ meta_rdp_peer_destroy (MetaRdpPeerContext *peer_ctx)
 
 /* ---- gfxredir caps negotiation callbacks (ported from rdprail.c) ---- */
 
+/* Runs on the channel thread: hand the rejection to the main loop, which turns
+ * it into the error frame. */
+static void
+gfxredir_reject_caps (MetaRdpPeerContext *peer_ctx,
+                      const char         *reason)
+{
+  g_mutex_lock (&peer_ctx->gfxredir_mutex);
+  peer_ctx->gfxredir_caps_error = reason;
+  meta_rdp_peer_gfxredir_queue_dispatch_locked (peer_ctx);
+  g_mutex_unlock (&peer_ctx->gfxredir_mutex);
+}
+
 static UINT
 gfxredir_legacy_caps (GfxRedirServerContext           *context,
                       const GFXREDIR_LEGACY_CAPS_PDU   *caps)
 {
-  /* Legacy version 1 client is not supported: leave gfxredir_activated FALSE. */
   g_message ("rdp: gfxredir legacy caps v%d (v1 unsupported)", caps->version);
+  gfxredir_reject_caps (context->custom,
+                        "The client only speaks gfxredir v1; v2 is required.");
   return CHANNEL_RC_OK;
 }
 
@@ -2991,6 +3122,8 @@ gfxredir_caps_advertise (GfxRedirServerContext              *context,
   else
     {
       g_warning ("rdp: gfxredir client advertised no v2.0+ caps");
+      gfxredir_reject_caps (peer_ctx,
+                            "The client offered no gfxredir v2 caps.");
     }
 
   return CHANNEL_RC_OK;
@@ -3197,6 +3330,28 @@ meta_rdp_setup_disp (MetaRdpPeerContext *peer_ctx)
              DISPLAY_CONTROL_MAX_MONITOR_HEIGHT);
 }
 
+/* A client with gfxredir confirms caps right after the channel opens, well
+ * inside this. One without it -- or without a share to map, which the Windows
+ * client needs /wslgsharedmemorypath: for -- never answers at all. */
+#define META_RDP_GFXREDIR_CAPS_TIMEOUT_S 5
+
+static gboolean
+meta_rdp_gfxredir_caps_timeout (gpointer user_data)
+{
+  MetaRdpPeerContext *peer_ctx = user_data;
+
+  peer_ctx->gfxredir_caps_timeout_id = 0;
+
+  if (!g_atomic_int_get (&peer_ctx->gfxredir_activated))
+    {
+      meta_rdp_peer_fail (peer_ctx,
+                          "The client did not open the gfxredir channel.",
+                          META_RDP_HINT_CLIENT);
+    }
+
+  return G_SOURCE_REMOVE;
+}
+
 static void
 meta_rdp_setup_gfxredir (MetaRdpPeerContext *peer_ctx)
 {
@@ -3205,7 +3360,8 @@ meta_rdp_setup_gfxredir (MetaRdpPeerContext *peer_ctx)
 
   if (!self->shared_memory_mount_path)
     {
-      g_message ("rdp: no shared-memory mount; using codec fallback path");
+      meta_rdp_peer_fail (peer_ctx, self->shared_memory_error,
+                          META_RDP_HINT_SYSTEM_DISTRO);
       return;
     }
 
@@ -3214,6 +3370,8 @@ meta_rdp_setup_gfxredir (MetaRdpPeerContext *peer_ctx)
   if (!redir)
     {
       g_warning ("rdp: gfxredir_server_context_new failed");
+      meta_rdp_peer_fail (peer_ctx, "The gfxredir channel could not be created.",
+                          NULL);
       return;
     }
 
@@ -3226,11 +3384,15 @@ meta_rdp_setup_gfxredir (MetaRdpPeerContext *peer_ctx)
     {
       g_warning ("rdp: gfxredir Open failed");
       gfxredir_server_context_free (redir);
+      meta_rdp_peer_fail (peer_ctx, "The gfxredir channel could not be opened.",
+                          META_RDP_HINT_CLIENT);
       return;
     }
 
   peer_ctx->gfxredir = redir;
-  peer_ctx->use_gfxredir = TRUE;
+  peer_ctx->gfxredir_caps_timeout_id =
+    g_timeout_add_seconds (META_RDP_GFXREDIR_CAPS_TIMEOUT_S,
+                           meta_rdp_gfxredir_caps_timeout, peer_ctx);
   g_message ("rdp: gfxredir channel opened; awaiting caps advertise");
 }
 
@@ -4583,6 +4745,8 @@ meta_rdp_peer_finish_activation (freerdp_peer *client)
           g_message ("rdp: peer %p re-activated at %ux%u, repainting", client,
                      freerdp_settings_get_uint32 (settings, FreeRDP_DesktopWidth),
                      freerdp_settings_get_uint32 (settings, FreeRDP_DesktopHeight));
+          peer_ctx->error_frame_width = 0;
+          peer_ctx->error_frame_height = 0;
           meta_rdp_peer_force_full_present (peer_ctx);
         }
 
@@ -4637,16 +4801,9 @@ meta_rdp_peer_finish_activation (freerdp_peer *client)
   meta_rdp_setup_gfxredir (peer_ctx);
   meta_rdp_setup_rdpei (peer_ctx);
 
-  if (peer_ctx->use_gfxredir)
-    {
-      /* gfxredir isn't ready yet; the full present is forced from
-       * gfxredir_caps_advertise() once caps are confirmed. */
-      return TRUE;
-    }
-
-  /* Codec fallback: fill the screen now. */
-  meta_rdp_peer_force_full_present (peer_ctx);
-
+  /* Nothing to present yet. The first full frame is forced once gfxredir caps
+   * are confirmed (gfxredir_caps_advertise()), or, if gfxredir cannot be used,
+   * by meta_rdp_peer_fail(). */
   return TRUE;
 }
 
@@ -4812,6 +4969,9 @@ rdp_peer_context_free (freerdp_peer *client, rdpContext *context)
   g_clear_handle_id (&peer_ctx->gfxredir_idle_id, g_source_remove);
   g_mutex_unlock (&peer_ctx->gfxredir_mutex);
   g_mutex_clear (&peer_ctx->gfxredir_mutex);
+  g_clear_handle_id (&peer_ctx->gfxredir_caps_timeout_id, g_source_remove);
+  g_clear_pointer (&peer_ctx->error_reason, g_free);
+  g_clear_pointer (&peer_ctx->error_hint, g_free);
 
   if (peer_ctx->disp)
     {
@@ -5519,23 +5679,31 @@ meta_rdp_server_new (MetaBackend  *backend,
   self = g_object_new (META_TYPE_RDP_SERVER, NULL);
   self->backend = backend;
 
+  /* Checked once, here, but only acted on per peer (meta_rdp_setup_gfxredir()):
+   * without the share there is nothing to show but the error frame, and that
+   * needs a connected client to show it to. */
   self->shared_memory_mount_path =
     g_strdup (g_getenv ("WSL2_SHARED_MEMORY_MOUNT_POINT"));
-  if (self->shared_memory_mount_path &&
-      !meta_rdp_is_mount_point (self->shared_memory_mount_path))
+  if (!self->shared_memory_mount_path)
     {
-      /* Not every system distro publishes the shared-memory share, and
-       * without it gfxredir would just create files in a plain directory
-       * the client can't see. */
-      g_message ("rdp: %s is not mounted; codec fallback only",
-                 self->shared_memory_mount_path);
+      self->shared_memory_error =
+        g_strdup ("WSL2_SHARED_MEMORY_MOUNT_POINT is not set.");
+    }
+  else if (!meta_rdp_is_mount_point (self->shared_memory_mount_path))
+    {
+      /* Without the share, gfxredir would create its pools in a plain
+       * directory the client cannot see. */
+      self->shared_memory_error =
+        g_strdup_printf ("The WSLg shared-memory share is not mounted at %s.",
+                         self->shared_memory_mount_path);
       g_clear_pointer (&self->shared_memory_mount_path, g_free);
     }
-  else if (self->shared_memory_mount_path)
-    g_message ("rdp: shared-memory mount: %s (gfxredir fast path enabled)",
-               self->shared_memory_mount_path);
+
+  if (self->shared_memory_error)
+    g_warning ("rdp: %s Clients will get the error frame.",
+               self->shared_memory_error);
   else
-    g_message ("rdp: WSL2_SHARED_MEMORY_MOUNT_POINT unset; codec fallback only");
+    g_message ("rdp: shared-memory mount: %s", self->shared_memory_mount_path);
 
   context = meta_backend_get_context (backend);
 
@@ -5595,6 +5763,7 @@ meta_rdp_server_dispose (GObject *object)
   g_clear_pointer (&self->key_file, g_free);
   g_clear_pointer (&self->cert_dir, g_free);
   g_clear_pointer (&self->shared_memory_mount_path, g_free);
+  g_clear_pointer (&self->shared_memory_error, g_free);
 
   self->backend = NULL;
 
