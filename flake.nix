@@ -22,9 +22,11 @@
           inputsFrom = [ pkgs.mutter ];
 
           packages = with pkgs; [
-            # -Drdp=enabled: freerdp3, freerdp-server3, winpr3. nixpkgs' mutter
-            # is built without the RDP backend, so it is not in inputsFrom.
+            # -Drdp=enabled: freerdp3, freerdp-server3, winpr3, and libcrypto
+            # for the session certificate. nixpkgs' mutter is built without
+            # the RDP backend, so they are not in inputsFrom.
             freerdp
+            openssl
             pipewire
 
             meson

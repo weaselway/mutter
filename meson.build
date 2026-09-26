@@ -335,7 +335,9 @@ if have_rdp
     required: get_option('rdp'))
   winpr_dep = dependency('winpr3', version: freerdp_req,
     required: get_option('rdp'))
-  rdp_deps = [freerdp_dep, freerdp_server_dep, winpr_dep]
+  # The session's self-signed TLS certificate is made with libcrypto.
+  libcrypto_dep = dependency('libcrypto', required: get_option('rdp'))
+  rdp_deps = [freerdp_dep, freerdp_server_dep, winpr_dep, libcrypto_dep]
   have_gfxredir = cc.has_header('freerdp/server/gfxredir.h',
     dependencies: freerdp_server_dep)
   # MS-RDPEDISP, used to let the client pick the desktop resolution. Unlike
