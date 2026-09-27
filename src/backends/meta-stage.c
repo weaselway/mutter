@@ -587,12 +587,22 @@ meta_stage_rebuild_views (MetaStage *stage)
   MetaStageImpl *stage_impl = META_STAGE_IMPL (stage_window);
   MetaMonitorManager *monitor_manager =
     meta_backend_get_monitor_manager (stage->backend);
+  ClutterActorIter iter;
+  ClutterActor *child;
   int width, height;
 
   meta_stage_impl_rebuild_views (stage_impl);
 
   meta_monitor_manager_get_screen_size (monitor_manager, &width, &height);
   clutter_actor_set_size (CLUTTER_ACTOR (stage), width, height);
+
+  /* Top-level actors may derive their preferred size from the stage size
+   * (e.g. gnome-shell's uiGroup), which Clutter can't track as a dependency.
+   * Drop their cached size requests so the stage relayout picks up the new
+   * size instead of allocating them with the old one. */
+  clutter_actor_iter_init (&iter, CLUTTER_ACTOR (stage));
+  while (clutter_actor_iter_next (&iter, &child))
+    clutter_actor_queue_relayout (child);
 
   g_list_foreach (stage->overlays,
                   (GFunc) meta_overlay_invalidate_views,
