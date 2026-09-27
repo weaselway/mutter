@@ -47,9 +47,36 @@ These are the same as `weaselway/dev/build-mutter.sh`, without
   freerdp is enough.
 - The first configure downloads the `gvdb` subproject and leaves an untracked
   `subprojects/.wraplock`. Both are harmless.
-- Branches: `main` and `50.5-wslg` are the same 50.5 tree. `50.4-wslg`
-  carries the same RDP backend on 50.4, which the NixOS image builds, and
-  `50.1-wslg` on 50.1, which the Ubuntu packages
-  (`weaselway/ubuntu/resolute/build-mutter.sh`) build. All of them carry this
-  shell, so changes go to `main` and are cherry-picked onto the release
-  branches.
+
+## Branches
+
+The fork is a short series of commits on top of an upstream release tag. The
+same series lives on every branch, and each branch carries this file.
+
+| Branch | Base | Built by |
+|---|---|---|
+| `main` | newest series we ship (now 50.5, same as `50.5-wslg`) | development |
+| `50.1-wslg` | 50.1 | Ubuntu packages (`weaselway/ubuntu/resolute/build-mutter.sh`), which apply it to Ubuntu's 50.1 source |
+| `50.4-wslg` | 50.4 | NixOS image (`weaselway/flake.nix`), matching nixpkgs' mutter |
+| `50.5-wslg` | 50.5 | nothing yet |
+| `51.0-wslg` | 51.0 | nothing yet; see below |
+
+- We don't follow upstream `main`. The fork is ~10k lines, and a moving
+  target would mean constant rebasing for a branch nobody builds. We port
+  once per upstream release instead.
+- Work happens on `main`. Fixes are then `git cherry-pick -x`'d onto every
+  release branch still built by something. Features stay on `main` unless
+  a consumer needs them.
+- `X.Y-wslg` branches exist only for versions a consumer builds. To create
+  one: `git switch -c X.Y-wslg X.Y && git cherry-pick <main's base tag>..main`.
+  Delete a branch once nothing builds it anymore.
+- NixOS 26.05 and Ubuntu 26.04 stay on GNOME 50, so the 50.x branches get
+  fixes for as long as those releases are supported.
+- `51.0-wslg` is the port to GNOME 51. It doesn't build yet: the dev shell
+  here is nixos-26.05, which lacks GNOME 51's dependencies (e.g.
+  gsettings-desktop-schemas >= 51.rc). Once it builds and something ships
+  51, `main` moves to it, and the 50.x branches only get backports.
+- Keep the series short: every commit is a possible conflict when porting.
+  When creating a branch for a new release, fold follow-up fixes into the
+  commit they fix (`git rebase -i --autosquash` on the new branch), since
+  that branch isn't published yet.
