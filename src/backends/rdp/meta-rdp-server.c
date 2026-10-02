@@ -1679,8 +1679,9 @@ meta_rdp_readback_cancel (MetaRdpPeerContext *peer_ctx)
   if (!peer_ctx->readback_pending)
     return;
 
-  g_debug ("rdp: cancelling in-flight readback into buffer %d",
-           peer_ctx->readback_buffer);
+  meta_topic (META_DEBUG_REMOTE_DESKTOP,
+              "rdp: cancelling in-flight readback into buffer %d",
+              peer_ctx->readback_buffer);
 
   meta_rdp_readback_disarm (peer_ctx);
   g_clear_pointer (&peer_ctx->readback_fence, cogl_gpu_fence_free);
@@ -2021,7 +2022,8 @@ meta_rdp_present_gfxredir (MetaRdpPeerContext *peer_ctx,
    * the main loop: one that has already arrived on the channel thread still
    * counts as in flight until the idle dispatch runs. Subtract those to get
    * the number the client is genuinely still holding. */
-  if (peer_ctx->n_presents_inflight > 0)
+  if (peer_ctx->n_presents_inflight > 0 &&
+      meta_is_topic_enabled (META_DEBUG_REMOTE_DESKTOP))
     {
       int unretired;
       int really_held;
@@ -2032,9 +2034,10 @@ meta_rdp_present_gfxredir (MetaRdpPeerContext *peer_ctx,
 
       really_held = peer_ctx->n_presents_inflight - unretired;
 
-      g_debug ("rdp: gfxredir writing buffer %d, client holds %d present(s) "
-               "(%d in flight, %d acked but not yet retired)",
-               index, really_held, peer_ctx->n_presents_inflight, unretired);
+      meta_topic (META_DEBUG_REMOTE_DESKTOP,
+                  "rdp: gfxredir writing buffer %d, client holds %d present(s) "
+                  "(%d in flight, %d acked but not yet retired)",
+                  index, really_held, peer_ctx->n_presents_inflight, unretired);
     }
 
   buffer = &peer_ctx->buffers[index];
@@ -2179,14 +2182,15 @@ meta_rdp_gfxredir_send_present (MetaRdpPeerContext *peer_ctx,
   present.numOpaqueRects = 1;
   present.opaqueRects = &opaque_rect;
 
-  g_debug ("rdp: gfxredir -> PresentBuffer presentId=%" G_GUINT64_FORMAT
-           " bufferId=%" G_GUINT64_FORMAT " windowId=%" G_GUINT64_FORMAT
-           " rect=%ux%u+%u+%u target=%dx%d",
-           (uint64_t) present.presentId, (uint64_t) present.bufferId,
-           (uint64_t) present.windowId,
-           present.dirtyRect.width, present.dirtyRect.height,
-           present.dirtyRect.left, present.dirtyRect.top,
-           width, height);
+  meta_topic (META_DEBUG_REMOTE_DESKTOP,
+              "rdp: gfxredir -> PresentBuffer presentId=%" G_GUINT64_FORMAT
+              " bufferId=%" G_GUINT64_FORMAT " windowId=%" G_GUINT64_FORMAT
+              " rect=%ux%u+%u+%u target=%dx%d",
+              (uint64_t) present.presentId, (uint64_t) present.bufferId,
+              (uint64_t) present.windowId,
+              present.dirtyRect.width, present.dirtyRect.height,
+              present.dirtyRect.left, present.dirtyRect.top,
+              width, height);
 
   if (redir->PresentBuffer (redir, &present) == 0)
     {
@@ -3026,7 +3030,8 @@ meta_rdp_fd_source_dispatch (GSource     *source,
 
   revents = g_source_query_unix_fd (source, fd_source->fd_tag);
 
-    g_debug ("rdp: fd source %s (fd %d) dispatch #%" G_GUINT64_FORMAT
+    meta_topic (META_DEBUG_REMOTE_DESKTOP,
+                "rdp: fd source %s (fd %d) dispatch #%" G_GUINT64_FORMAT
                 " revents=0x%x",
                 fd_source->label, fd_source->fd,
                 fd_source->dispatch_count, (unsigned int) revents);
@@ -3226,9 +3231,10 @@ gfxredir_present_buffer_ack (GfxRedirServerContext                 *context,
 {
   MetaRdpPeerContext *peer_ctx = context->custom;
 
-  g_debug ("rdp: gfxredir <- PresentBufferAck presentId=%" G_GUINT64_FORMAT
-           " windowId=%" G_GUINT64_FORMAT,
-           (uint64_t) ack->presentId, (uint64_t) ack->windowId);
+  meta_topic (META_DEBUG_REMOTE_DESKTOP,
+              "rdp: gfxredir <- PresentBufferAck presentId=%" G_GUINT64_FORMAT
+              " windowId=%" G_GUINT64_FORMAT,
+              (uint64_t) ack->presentId, (uint64_t) ack->windowId);
 
   if (ack->windowId == META_RDP_DESKTOP_WINDOW_ID)
     {
@@ -3240,10 +3246,11 @@ gfxredir_present_buffer_ack (GfxRedirServerContext                 *context,
           /* Issued against a pool we have since destroyed (a resize). The
            * buffer it names no longer exists, and retiring it would free a
            * same-indexed buffer of the new pool that is still in flight. */
-          g_debug ("rdp: gfxredir dropping stale ack presentId=%"
-                   G_GUINT64_FORMAT " (pool rebuilt at %" G_GUINT64_FORMAT ")",
-                   (uint64_t) ack->presentId,
-                   (uint64_t) peer_ctx->present_id_floor);
+          meta_topic (META_DEBUG_REMOTE_DESKTOP,
+                      "rdp: gfxredir dropping stale ack presentId=%"
+                      G_GUINT64_FORMAT " (pool rebuilt at %" G_GUINT64_FORMAT ")",
+                      (uint64_t) ack->presentId,
+                      (uint64_t) peer_ctx->present_id_floor);
         }
       else if (peer_ctx->gfxredir_n_acked < META_RDP_N_BUFFERS)
         {
