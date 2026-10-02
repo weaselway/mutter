@@ -47,6 +47,8 @@
 #include <freerdp/server/audin.h>
 #include <winpr/stream.h>
 
+#include "meta/meta-debug.h"
+
 /* Where the protocol-simple servers listen. Must match server.address in the
  * PipeWire drop-in. Overridable mainly so the bridge can be pointed at a
  * PipeWire running somewhere else while debugging. */
@@ -434,10 +436,11 @@ rdp_audio_out_skip_backlog (MetaRdpAudioOut *audio_out)
   excess = (size_t) available - audio_out->max_backlog_bytes;
   excess -= excess % audio_out->bytes_per_frame;
 
-  g_debug ("rdp: audio: dropping %zu bytes (%zu ms) of backlog",
-           excess,
-           excess / audio_out->bytes_per_frame * 1000 /
-           rdp_audio_out_format.nSamplesPerSec);
+  meta_topic (META_DEBUG_WEASELWAY,
+              "rdp: audio: dropping %zu bytes (%zu ms) of backlog",
+              excess,
+              excess / audio_out->bytes_per_frame * 1000 /
+              rdp_audio_out_format.nSamplesPerSec);
 
   while (excess > 0)
     {
