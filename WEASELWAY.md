@@ -65,8 +65,10 @@ same series lives on every branch, and each branch carries this file.
   target would mean constant rebasing for a branch nobody builds. We port
   once per upstream release instead.
 - Work happens on `main`. Fixes are then `git cherry-pick -x`'d onto every
-  release branch still built by something. Features stay on `main` unless
-  a consumer needs them.
+  release branch: the ones built by something, and the ones for releases
+  nothing builds yet (now `50.5-wslg` and `51.0-wslg`), so that a port
+  doesn't start out without them. Features stay on `main` unless a consumer
+  needs them.
 - `X.Y-wslg` branches exist only for versions a consumer builds. To create
   one: `git switch -c X.Y-wslg X.Y && git cherry-pick <main's base tag>..main`.
   Delete a branch once nothing builds it anymore.
