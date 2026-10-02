@@ -1646,6 +1646,7 @@ meta_rdp_acquire_buffer (MetaRdpPeerContext *peer_ctx)
 static void meta_rdp_gfxredir_send_present (MetaRdpPeerContext *peer_ctx,
                                             int                 index,
                                             const MtkRectangle *damage);
+static void meta_rdp_peer_present_missed (MetaRdpPeerContext *peer_ctx);
 
 static void
 meta_rdp_readback_disarm (MetaRdpPeerContext *peer_ctx)
@@ -1796,14 +1797,23 @@ meta_rdp_readback_poll_cb (gpointer user_data)
    * from in here that just clears the id (see meta_rdp_readback_disarm()), and
    * returning G_SOURCE_REMOVE is what actually tears the source down. */
   if (meta_rdp_readback_finish (peer_ctx, peer_ctx->readback_fence == NULL))
-    return G_SOURCE_REMOVE;
+    {
+      /* Damage that was only held back by this readback can go now, rather
+       * than waiting for the next ack to come round. Only from here: when a
+       * frame collects the readback instead, that frame's own present takes
+       * the missed damage along (see meta_rdp_peer_present()). This may arm a
+       * new poll timer, which is a different source from this one. */
+      meta_rdp_peer_present_missed (peer_ctx);
+      return G_SOURCE_REMOVE;
+    }
 
   if (peer_ctx->readback_polls >= META_RDP_READBACK_MAX_POLLS)
     {
       g_warning ("rdp: readback fence has not signalled after %d polls; "
                  "collecting synchronously",
                  peer_ctx->readback_polls);
-      meta_rdp_readback_finish (peer_ctx, TRUE);
+      if (meta_rdp_readback_finish (peer_ctx, TRUE))
+        meta_rdp_peer_present_missed (peer_ctx);
       return G_SOURCE_REMOVE;
     }
 
@@ -2268,6 +2278,7 @@ meta_rdp_peer_present (MetaRdpPeerContext *peer_ctx,
                        CoglFramebuffer    *framebuffer,
                        const MtkRegion    *damage)
 {
+  g_autoptr (MtkRegion) combined = NULL;
   MtkRectangle extents;
 
   if (!peer_ctx->activated)
@@ -2312,6 +2323,19 @@ meta_rdp_peer_present (MetaRdpPeerContext *peer_ctx,
           peer_ctx->frame_missed = TRUE;
         }
       return;
+    }
+
+  /* Take along whatever is still owed from frames that could not be sent,
+   * instead of leaving it for a present of its own after the next ack. */
+  if (peer_ctx->frame_missed)
+    {
+      peer_ctx->frame_missed = FALSE;
+      combined = g_steal_pointer (&peer_ctx->missed_damage);
+      if (combined)
+        {
+          mtk_region_union (combined, damage);
+          damage = combined;
+        }
     }
 
   extents = mtk_region_get_extents (damage);
@@ -2361,6 +2385,22 @@ meta_rdp_peer_present_region (MetaRdpPeerContext *peer_ctx,
     }
 }
 
+/* Present the damage that could not be sent when it happened, if any. Should
+ * it still not go through, meta_rdp_peer_present() records it again. */
+static void
+meta_rdp_peer_present_missed (MetaRdpPeerContext *peer_ctx)
+{
+  g_autoptr (MtkRegion) region = NULL;
+
+  if (!peer_ctx->frame_missed)
+    return;
+
+  peer_ctx->frame_missed = FALSE;
+  region = g_steal_pointer (&peer_ctx->missed_damage);
+  if (region)
+    meta_rdp_peer_present_region (peer_ctx, region);
+}
+
 static void
 meta_rdp_peer_force_full_present (MetaRdpPeerContext *peer_ctx)
 {
@@ -2405,7 +2445,6 @@ meta_rdp_peer_gfxredir_dispatch (gpointer user_data)
   const char *caps_error;
   uint64_t acked[META_RDP_N_BUFFERS];
   int n_acked;
-  g_autoptr (MtkRegion) region = NULL;
 
   g_mutex_lock (&peer_ctx->gfxredir_mutex);
   peer_ctx->gfxredir_idle_id = 0;
@@ -2441,17 +2480,18 @@ meta_rdp_peer_gfxredir_dispatch (gpointer user_data)
         }
     }
 
-  /* Damage that could not be sent because every buffer was busy. */
-  if (n_acked > 0 && peer_ctx->frame_missed)
-    {
-      peer_ctx->frame_missed = FALSE;
-      region = g_steal_pointer (&peer_ctx->missed_damage);
-    }
-
   if (full_requested)
-    meta_rdp_peer_present_region (peer_ctx, NULL);
-  else if (region)
-    meta_rdp_peer_present_region (peer_ctx, region);
+    {
+      /* The whole screen covers anything still owed. */
+      peer_ctx->frame_missed = FALSE;
+      g_clear_pointer (&peer_ctx->missed_damage, mtk_region_unref);
+      meta_rdp_peer_present_region (peer_ctx, NULL);
+    }
+  else if (n_acked > 0)
+    {
+      /* Damage that could not be sent because every buffer was busy. */
+      meta_rdp_peer_present_missed (peer_ctx);
+    }
 
   return G_SOURCE_REMOVE;
 }
