@@ -1513,6 +1513,107 @@ meta_rdp_region_area (const MtkRegion *region)
   return area;
 }
 
+/* Meter for what the present path does around the readback, reported like the
+ * readback meters (once a second, with MUTTER_DEBUG=remote-desktop).
+ *
+ *   - presents, and how many could reuse the buffer written last, which needs
+ *     no stale-fill at all (see meta_rdp_acquire_buffer()).
+ *   - stale-fill: bytes copied between pool buffers to make one whole again.
+ *   - coalesced: frames whose damage could not be sent when it was painted,
+ *     split by what was in the way -- every buffer with the client, or the
+ *     previous readback not landed. Those frames were rendered without the
+ *     client ever seeing them on their own.
+ *   - over-read: pixels read back and sent against pixels actually damaged.
+ *     The difference is the price of the single dirtyRect (the bounding box
+ *     of the damage) plus the widening to the readback alignment. */
+typedef struct _MetaRdpPresentMeter
+{
+  int64_t window_start_us;
+  unsigned presents;
+  unsigned reused;
+  size_t stale_bytes;
+  unsigned coalesced_busy;
+  unsigned coalesced_readback;
+  int64_t damaged_px;
+  int64_t read_px;
+} MetaRdpPresentMeter;
+
+static MetaRdpPresentMeter present_meter;
+
+static void
+meta_rdp_present_meter_report (void)
+{
+  int64_t now_us = g_get_monotonic_time ();
+  int64_t elapsed_us;
+  double per_s;
+
+  if (present_meter.window_start_us == 0)
+    {
+      present_meter.window_start_us = now_us;
+      return;
+    }
+
+  elapsed_us = now_us - present_meter.window_start_us;
+  if (elapsed_us < G_USEC_PER_SEC)
+    return;
+
+  per_s = (double) G_USEC_PER_SEC / elapsed_us;
+
+  meta_topic (META_DEBUG_REMOTE_DESKTOP,
+              "rdp: present %.1f/s (%u of %u reused the last buffer), "
+              "stale-fill %.2f MB/s, coalesced %.1f/s buffers busy + "
+              "%.1f/s readback pending, read %.2f Mpx/s for %.2f Mpx/s "
+              "damaged (%.1fx)",
+              present_meter.presents * per_s,
+              present_meter.reused, present_meter.presents,
+              present_meter.stale_bytes * per_s / (1024.0 * 1024.0),
+              present_meter.coalesced_busy * per_s,
+              present_meter.coalesced_readback * per_s,
+              present_meter.read_px * per_s / 1e6,
+              present_meter.damaged_px * per_s / 1e6,
+              present_meter.damaged_px > 0
+                ? (double) present_meter.read_px / present_meter.damaged_px
+                : 0.0);
+
+  present_meter = (MetaRdpPresentMeter) { .window_start_us = now_us };
+}
+
+/* A present that goes ahead: @damage is what changed, @rect what is read back
+ * for it, @stale_px what had to be copied in from another buffer first. */
+static void
+meta_rdp_account_present (const MtkRegion    *damage,
+                          const MtkRectangle *rect,
+                          int64_t             stale_px,
+                          gboolean            reused)
+{
+  if (!meta_is_topic_enabled (META_DEBUG_REMOTE_DESKTOP))
+    return;
+
+  present_meter.presents++;
+  if (reused)
+    present_meter.reused++;
+  present_meter.stale_bytes += (size_t) stale_px * 4;
+  present_meter.damaged_px += meta_rdp_region_area (damage);
+  present_meter.read_px += (int64_t) rect->width * rect->height;
+
+  meta_rdp_present_meter_report ();
+}
+
+/* A frame whose damage had to be set aside. */
+static void
+meta_rdp_account_coalesced (gboolean readback_pending)
+{
+  if (!meta_is_topic_enabled (META_DEBUG_REMOTE_DESKTOP))
+    return;
+
+  if (readback_pending)
+    present_meter.coalesced_readback++;
+  else
+    present_meter.coalesced_busy++;
+
+  meta_rdp_present_meter_report ();
+}
+
 /* Copy a region between two buffers in the pool.
  *
  * Both live in the same mapping at the same stride, so this is a row-wise
@@ -1990,12 +2091,13 @@ static void meta_rdp_peer_fail (MetaRdpPeerContext *peer_ctx,
 static void
 meta_rdp_present_gfxredir (MetaRdpPeerContext *peer_ctx,
                            CoglFramebuffer    *framebuffer,
-                           const MtkRectangle *damage)
+                           const MtkRegion    *damage)
 {
   int width = cogl_framebuffer_get_width (framebuffer);
   int height = cogl_framebuffer_get_height (framebuffer);
   MtkRectangle rect;
   MetaRdpBuffer *buffer;
+  int64_t stale_px = 0;
   int index;
 
   if (!meta_rdp_ensure_buffer (peer_ctx, width, height))
@@ -2042,8 +2144,9 @@ meta_rdp_present_gfxredir (MetaRdpPeerContext *peer_ctx,
 
   buffer = &peer_ctx->buffers[index];
 
-  /* Clip damage to bounds. */
-  rect = *damage;
+  /* The wire carries a single rect, so the bounding box it is; clip it to
+   * bounds. */
+  rect = mtk_region_get_extents (damage);
   if (rect.x < 0) { rect.width += rect.x; rect.x = 0; }
   if (rect.y < 0) { rect.height += rect.y; rect.y = 0; }
   if (rect.x + rect.width > width)
@@ -2098,10 +2201,16 @@ meta_rdp_present_gfxredir (MetaRdpPeerContext *peer_ctx,
       mtk_region_subtract_rectangle (buffer->stale, &rect);
 
       if (!mtk_region_is_empty (buffer->stale))
-        meta_rdp_copy_between_buffers (peer_ctx, peer_ctx->last_written, index,
-                                       buffer->stale);
+        {
+          meta_rdp_copy_between_buffers (peer_ctx, peer_ctx->last_written,
+                                         index, buffer->stale);
+          stale_px = meta_rdp_region_area (buffer->stale);
+        }
     }
   g_clear_pointer (&buffer->stale, mtk_region_unref);
+
+  meta_rdp_account_present (damage, &rect, stale_px,
+                            index == peer_ctx->last_written);
 
   /* Preferred path: read into the PBO and let the fence tell us when it has
    * landed. The present happens from meta_rdp_readback_finish(), not here. */
@@ -2283,7 +2392,6 @@ meta_rdp_peer_present (MetaRdpPeerContext *peer_ctx,
                        const MtkRegion    *damage)
 {
   g_autoptr (MtkRegion) combined = NULL;
-  MtkRectangle extents;
 
   if (!peer_ctx->activated)
     return;
@@ -2313,6 +2421,8 @@ meta_rdp_peer_present (MetaRdpPeerContext *peer_ctx,
   if (peer_ctx->n_presents_inflight >= META_RDP_N_BUFFERS ||
       peer_ctx->readback_pending)
     {
+      meta_rdp_account_coalesced (peer_ctx->readback_pending);
+
       /* Coalesce by merging this damage into what we still owe the
        * client, rather than dropping it and re-sending the whole screen
        * once an ack arrives. */
@@ -2342,8 +2452,7 @@ meta_rdp_peer_present (MetaRdpPeerContext *peer_ctx,
         }
     }
 
-  extents = mtk_region_get_extents (damage);
-  meta_rdp_present_gfxredir (peer_ctx, framebuffer, &extents);
+  meta_rdp_present_gfxredir (peer_ctx, framebuffer, damage);
 }
 
 /* Present a region of the current composited contents. A NULL region means the
