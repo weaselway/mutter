@@ -72,6 +72,7 @@ static const GDebugKey meta_debug_keys[] = {
   { "session-management", META_DEBUG_SESSION_MANAGEMENT },
   { "x11", META_DEBUG_X11 },
   { "workspaces", META_DEBUG_WORKSPACES },
+  { "weaselway", META_DEBUG_WEASELWAY },
 };
 
 static const GDebugKey meta_paint_debug_keys[] = {
@@ -429,6 +430,8 @@ meta_topic_to_string (MetaDebugTopic topic)
       return "X11";
     case META_DEBUG_WORKSPACES:
       return "WORKSPACES";
+    case META_DEBUG_WEASELWAY:
+      return "WEASELWAY";
     }
 
   return "WM";
