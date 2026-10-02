@@ -1492,6 +1492,27 @@ meta_rdp_ensure_buffer (MetaRdpPeerContext *peer_ctx,
   return TRUE;
 }
 
+/* Pixels covered by @region; a NULL region covers none. */
+static int64_t
+meta_rdp_region_area (const MtkRegion *region)
+{
+  int64_t area = 0;
+  int n_rects;
+
+  if (!region)
+    return 0;
+
+  n_rects = mtk_region_num_rectangles (region);
+  for (int i = 0; i < n_rects; i++)
+    {
+      MtkRectangle r = mtk_region_get_rectangle (region, i);
+
+      area += (int64_t) r.width * r.height;
+    }
+
+  return area;
+}
+
 /* Copy a region between two buffers in the pool.
  *
  * Both live in the same mapping at the same stride, so this is a row-wise
@@ -1530,13 +1551,26 @@ meta_rdp_copy_between_buffers (MetaRdpPeerContext *peer_ctx,
  * issued but whose pixels have not landed yet. The second case has no flag of
  * its own because at most one readback is outstanding -- it is simply the
  * buffer named by @readback_buffer. Handing that one out again would let the
- * next frame's stale-fill and readback race the copy-out of the previous one. */
+ * next frame's stale-fill and readback race the copy-out of the previous one.
+ *
+ * Among the free ones, the buffer that is missing the least wins, and the
+ * round-robin cursor only breaks ties. Rotating strictly would always pick a
+ * buffer that sat out the last two frames, and so pay for a stale-fill on
+ * every frame whose damage moved. The most recently written buffer is missing
+ * nothing at all, and it is free again as soon as the client has acked it --
+ * the ack says the client is done reading it, which is all the pool ever
+ * relies on. A client that acks within a frame therefore keeps getting the
+ * same buffer and nothing is copied between buffers. */
 static int
 meta_rdp_acquire_buffer (MetaRdpPeerContext *peer_ctx)
 {
+  int best = -1;
+  int64_t best_area = 0;
+
   for (int n = 0; n < META_RDP_N_BUFFERS; n++)
     {
       int i = (peer_ctx->next_buffer + n) % META_RDP_N_BUFFERS;
+      int64_t area;
 
       if (peer_ctx->buffers[i].in_flight)
         continue;
@@ -1544,11 +1578,24 @@ meta_rdp_acquire_buffer (MetaRdpPeerContext *peer_ctx)
       if (peer_ctx->readback_pending && peer_ctx->readback_buffer == i)
         continue;
 
-      peer_ctx->next_buffer = (i + 1) % META_RDP_N_BUFFERS;
-      return i;
+      if (i == peer_ctx->last_written)
+        {
+          best = i;
+          break;
+        }
+
+      area = meta_rdp_region_area (peer_ctx->buffers[i].stale);
+      if (best < 0 || area < best_area)
+        {
+          best = i;
+          best_area = area;
+        }
     }
 
-  return -1;
+  if (best >= 0)
+    peer_ctx->next_buffer = (best + 1) % META_RDP_N_BUFFERS;
+
+  return best;
 }
 
 /* ------------------------------------------------------------------ */
