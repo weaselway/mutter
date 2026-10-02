@@ -50,6 +50,8 @@
  * @META_DEBUG_KMS_DEADLINE: KMS deadline timers
  * @META_DEBUG_SESSION_MANAGEMENT: session management
  * @META_DEBUG_X11: X11 window management
+ * @META_DEBUG_WORKSPACES: workspaces
+ * @META_DEBUG_WEASELWAY: the weaselway RDP backend
  */
 typedef enum
 {
@@ -84,6 +86,7 @@ typedef enum
   META_DEBUG_SESSION_MANAGEMENT = 1 << 27,
   META_DEBUG_X11             = 1 << 28,
   META_DEBUG_WORKSPACES      = 1 << 29,
+  META_DEBUG_WEASELWAY       = 1 << 30,
 } MetaDebugTopic;
 
 META_EXPORT

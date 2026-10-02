@@ -572,7 +572,7 @@ meta_rdp_server_get_stage (MetaRdpServer *self)
 
 /* Rolling meter for the framebuffer readback: exponentially weighted so it
  * tracks recent activity, reported once a second (with
- * MUTTER_DEBUG=remote-desktop), process-wide statics.
+ * MUTTER_DEBUG=weaselway), process-wide statics.
  *
  * This is the number the readback work is aimed at: glReadPixels here is a
  * synchronous GPU->CPU transfer that on d3d12 costs a blit into a staging
@@ -609,7 +609,7 @@ meta_rdp_account_readback (int64_t elapsed_us,
   int64_t now_us;
   int64_t elapsed_window_us;
 
-  if (!meta_is_topic_enabled (META_DEBUG_REMOTE_DESKTOP))
+  if (!meta_is_topic_enabled (META_DEBUG_WEASELWAY))
     return;
 
   now_us = g_get_monotonic_time ();
@@ -653,7 +653,7 @@ meta_rdp_account_readback (int64_t elapsed_us,
   /* The last figure is the share of wall-clock time the main loop spent
    * blocked in glReadPixels; at 60fps anything approaching 100% means the
    * compositor is doing nothing but readback. */
-  meta_topic (META_DEBUG_REMOTE_DESKTOP,
+  meta_topic (META_DEBUG_WEASELWAY,
               "rdp: readback %.0f us/read (mean %.0f, peak %.0f), "
               "%.0f us fence (mean %.0f), "
               "%.1f reads/s (mean %.1f), %.2f MB/s (mean %.2f), %.1f%% of wall",
@@ -944,7 +944,7 @@ meta_rdp_account_readback_collect (int64_t  copy_us,
   int64_t now_us;
   int64_t elapsed_us;
 
-  if (!meta_is_topic_enabled (META_DEBUG_REMOTE_DESKTOP))
+  if (!meta_is_topic_enabled (META_DEBUG_WEASELWAY))
     return;
 
   now_us = g_get_monotonic_time ();
@@ -979,7 +979,7 @@ meta_rdp_account_readback_collect (int64_t  copy_us,
       mean_latency_us = alpha * latency + (1.0 - alpha) * mean_latency_us;
     }
 
-  meta_topic (META_DEBUG_REMOTE_DESKTOP,
+  meta_topic (META_DEBUG_WEASELWAY,
               "rdp: collect %.0f us copy (mean %.0f), %.0f us latency "
               "(mean %.0f), %.1f collects/s, %.2f MB/s, %u blocked, "
               "%.1f%% of wall",
@@ -1514,7 +1514,7 @@ meta_rdp_region_area (const MtkRegion *region)
 }
 
 /* Meter for what the present path does around the readback, reported like the
- * readback meters (once a second, with MUTTER_DEBUG=remote-desktop).
+ * readback meters (once a second, with MUTTER_DEBUG=weaselway).
  *
  *   - presents, and how many could reuse the buffer written last, which needs
  *     no stale-fill at all (see meta_rdp_acquire_buffer()).
@@ -1559,7 +1559,7 @@ meta_rdp_present_meter_report (void)
 
   per_s = (double) G_USEC_PER_SEC / elapsed_us;
 
-  meta_topic (META_DEBUG_REMOTE_DESKTOP,
+  meta_topic (META_DEBUG_WEASELWAY,
               "rdp: present %.1f/s (%u of %u reused the last buffer), "
               "stale-fill %.2f MB/s, coalesced %.1f/s buffers busy + "
               "%.1f/s readback pending, read %.2f Mpx/s for %.2f Mpx/s "
@@ -1586,7 +1586,7 @@ meta_rdp_account_present (const MtkRegion    *damage,
                           int64_t             stale_px,
                           gboolean            reused)
 {
-  if (!meta_is_topic_enabled (META_DEBUG_REMOTE_DESKTOP))
+  if (!meta_is_topic_enabled (META_DEBUG_WEASELWAY))
     return;
 
   present_meter.presents++;
@@ -1603,7 +1603,7 @@ meta_rdp_account_present (const MtkRegion    *damage,
 static void
 meta_rdp_account_coalesced (gboolean readback_pending)
 {
-  if (!meta_is_topic_enabled (META_DEBUG_REMOTE_DESKTOP))
+  if (!meta_is_topic_enabled (META_DEBUG_WEASELWAY))
     return;
 
   if (readback_pending)
@@ -1780,7 +1780,7 @@ meta_rdp_readback_cancel (MetaRdpPeerContext *peer_ctx)
   if (!peer_ctx->readback_pending)
     return;
 
-  meta_topic (META_DEBUG_REMOTE_DESKTOP,
+  meta_topic (META_DEBUG_WEASELWAY,
               "rdp: cancelling in-flight readback into buffer %d",
               peer_ctx->readback_buffer);
 
@@ -2125,7 +2125,7 @@ meta_rdp_present_gfxredir (MetaRdpPeerContext *peer_ctx,
    * counts as in flight until the idle dispatch runs. Subtract those to get
    * the number the client is genuinely still holding. */
   if (peer_ctx->n_presents_inflight > 0 &&
-      meta_is_topic_enabled (META_DEBUG_REMOTE_DESKTOP))
+      meta_is_topic_enabled (META_DEBUG_WEASELWAY))
     {
       int unretired;
       int really_held;
@@ -2136,7 +2136,7 @@ meta_rdp_present_gfxredir (MetaRdpPeerContext *peer_ctx,
 
       really_held = peer_ctx->n_presents_inflight - unretired;
 
-      meta_topic (META_DEBUG_REMOTE_DESKTOP,
+      meta_topic (META_DEBUG_WEASELWAY,
                   "rdp: gfxredir writing buffer %d, client holds %d present(s) "
                   "(%d in flight, %d acked but not yet retired)",
                   index, really_held, peer_ctx->n_presents_inflight, unretired);
@@ -2291,7 +2291,7 @@ meta_rdp_gfxredir_send_present (MetaRdpPeerContext *peer_ctx,
   present.numOpaqueRects = 1;
   present.opaqueRects = &opaque_rect;
 
-  meta_topic (META_DEBUG_REMOTE_DESKTOP,
+  meta_topic (META_DEBUG_WEASELWAY,
               "rdp: gfxredir -> PresentBuffer presentId=%" G_GUINT64_FORMAT
               " bufferId=%" G_GUINT64_FORMAT " windowId=%" G_GUINT64_FORMAT
               " rect=%ux%u+%u+%u target=%dx%d",
@@ -3139,7 +3139,7 @@ meta_rdp_fd_source_dispatch (GSource     *source,
 
   revents = g_source_query_unix_fd (source, fd_source->fd_tag);
 
-    meta_topic (META_DEBUG_REMOTE_DESKTOP,
+    meta_topic (META_DEBUG_WEASELWAY,
                 "rdp: fd source %s (fd %d) dispatch #%" G_GUINT64_FORMAT
                 " revents=0x%x",
                 fd_source->label, fd_source->fd,
@@ -3340,7 +3340,7 @@ gfxredir_present_buffer_ack (GfxRedirServerContext                 *context,
 {
   MetaRdpPeerContext *peer_ctx = context->custom;
 
-  meta_topic (META_DEBUG_REMOTE_DESKTOP,
+  meta_topic (META_DEBUG_WEASELWAY,
               "rdp: gfxredir <- PresentBufferAck presentId=%" G_GUINT64_FORMAT
               " windowId=%" G_GUINT64_FORMAT,
               (uint64_t) ack->presentId, (uint64_t) ack->windowId);
@@ -3355,7 +3355,7 @@ gfxredir_present_buffer_ack (GfxRedirServerContext                 *context,
           /* Issued against a pool we have since destroyed (a resize). The
            * buffer it names no longer exists, and retiring it would free a
            * same-indexed buffer of the new pool that is still in flight. */
-          meta_topic (META_DEBUG_REMOTE_DESKTOP,
+          meta_topic (META_DEBUG_WEASELWAY,
                       "rdp: gfxredir dropping stale ack presentId=%"
                       G_GUINT64_FORMAT " (pool rebuilt at %" G_GUINT64_FORMAT ")",
                       (uint64_t) ack->presentId,
@@ -3784,7 +3784,7 @@ meta_rdp_rdpei_dispatch (gpointer user_data)
        * normalized against for horizontal/vertical touchpad swipes,
        * respectively -- included here so the running sums below can be
        * read directly as an approximate progress percentage. */
-      meta_topic (META_DEBUG_REMOTE_DESKTOP,
+      meta_topic (META_DEBUG_WEASELWAY,
                   "rdp: rdpei -> clutter touchpad-swipe %s fingers=%u delta=(%.1f,%.1f) "
                   "running=(%.1f,%.1f) [~%.0f%% of 400 horiz, ~%.0f%% of 300 vert]",
                   meta_rdp_gesture_phase_name (item->phase), item->fingers,
@@ -3844,7 +3844,7 @@ static void
 meta_rdp_rdpei_end_gesture_locked (MetaRdpPeerContext          *peer_ctx,
                                    ClutterTouchpadGesturePhase  phase)
 {
-  meta_topic (META_DEBUG_REMOTE_DESKTOP,
+  meta_topic (META_DEBUG_WEASELWAY,
               "rdp: rdpei gesture %s (fingers=%u, total emitted delta=(%.1f,%.1f))",
               meta_rdp_gesture_phase_name (phase),
               peer_ctx->rdpei_gesture_fingers,
@@ -3968,7 +3968,7 @@ meta_rdp_rdpei_evaluate_gesture_locked (MetaRdpPeerContext *peer_ctx)
 
     if (!peer_ctx->rdpei_gesture_active)
       {
-        meta_topic (META_DEBUG_REMOTE_DESKTOP,
+        meta_topic (META_DEBUG_WEASELWAY,
                     "rdp: rdpei gesture BEGIN (fingers=%u)", n_contacts);
         meta_rdp_rdpei_queue_gesture_locked (peer_ctx,
                                              CLUTTER_TOUCHPAD_GESTURE_PHASE_BEGIN,
@@ -4021,7 +4021,7 @@ meta_rdp_rdpei_evaluate_gesture_locked (MetaRdpPeerContext *peer_ctx)
         /* Sustained for long enough: this is a real change. Real touchpad
          * drivers cancel and restart in that case too (see
          * ClutterTouchpadGesturePhase's doc comment). */
-        meta_topic (META_DEBUG_REMOTE_DESKTOP,
+        meta_topic (META_DEBUG_WEASELWAY,
                     "rdp: rdpei gesture CANCEL+BEGIN: finger count %u -> %u persisted %u frames "
                     "(total emitted delta before cancel=(%.1f,%.1f))",
                     peer_ctx->rdpei_gesture_fingers, n_contacts,
@@ -4104,7 +4104,7 @@ meta_rdp_rdpei_touch_event (RdpeiServerContext          *context,
               (RDPINPUT_CONTACT_FLAG_UP | RDPINPUT_CONTACT_FLAG_CANCELED))
             {
               if (g_hash_table_remove (peer_ctx->rdpei_contacts, key))
-                meta_topic (META_DEBUG_REMOTE_DESKTOP,
+                meta_topic (META_DEBUG_WEASELWAY,
                             "rdp: rdpei contact %u up/canceled, %u contact(s) remain",
                             contact->contactId,
                             g_hash_table_size (peer_ctx->rdpei_contacts));
@@ -4120,7 +4120,7 @@ meta_rdp_rdpei_touch_event (RdpeiServerContext          *context,
                 {
                   p = g_new (graphene_point_t, 1);
                   g_hash_table_insert (peer_ctx->rdpei_contacts, key, p);
-                  meta_topic (META_DEBUG_REMOTE_DESKTOP,
+                  meta_topic (META_DEBUG_WEASELWAY,
                               "rdp: rdpei contact %u down at (%d,%d), %u contact(s) now active",
                               contact->contactId, contact->x, contact->y,
                               g_hash_table_size (peer_ctx->rdpei_contacts));
