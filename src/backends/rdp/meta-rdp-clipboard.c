@@ -930,16 +930,25 @@ meta_rdp_clipboard_get_event_handle (MetaRdpClipboard *clipboard)
 gboolean
 meta_rdp_clipboard_check_event_handle (MetaRdpClipboard *clipboard)
 {
+  HANDLE event;
   UINT rc;
 
   if (!clipboard || !clipboard->cliprdr)
     return TRUE;
 
-  rc = clipboard->cliprdr->CheckEventHandle (clipboard->cliprdr);
-  if (rc != CHANNEL_RC_OK)
+  /* Only read while the channel has something queued. This is called on any
+   * activity of the peer, and FreeRDP (3.28 and later) reports a read from
+   * an empty queue as ERROR_INVALID_DATA, which is indistinguishable from a
+   * protocol error and used to take the clipboard down on connect. */
+  event = clipboard->cliprdr->GetEventHandle (clipboard->cliprdr);
+  while (event && WaitForSingleObject (event, 0) == WAIT_OBJECT_0)
     {
-      g_warning ("rdp: cliprdr CheckEventHandle returned 0x%X", rc);
-      return FALSE;
+      rc = clipboard->cliprdr->CheckEventHandle (clipboard->cliprdr);
+      if (rc != CHANNEL_RC_OK)
+        {
+          g_warning ("rdp: cliprdr CheckEventHandle returned 0x%X", rc);
+          return FALSE;
+        }
     }
 
   return TRUE;
